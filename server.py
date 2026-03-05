@@ -2023,8 +2023,24 @@ if __name__ == "__main__":
 
         # OAuth URL rewrite: LAN/localhost clients get metadata matching
         # their connection URL instead of the public MAESTRO_ISSUER_URL.
-        from oauth_rewrite import OAuthURLRewriteMiddleware
-        app = OAuthURLRewriteMiddleware(app, _ISSUER_URL)
+        from oauth_rewrite import OAuthURLRewriteMiddleware, _parse_lan_origins
+        from urllib.parse import urlparse as _urlparse
+
+        # Build allowed origins allowlist
+        _parsed_issuer = _urlparse(_ISSUER_URL)
+        _canonical_host = _parsed_issuer.netloc  # e.g. "maestro.rmstxrx.dev"
+        _allowed_origins: dict[str, str] = {
+            _canonical_host: _ISSUER_URL,
+            # Always allow localhost/loopback
+            "localhost:8222": "http://localhost:8222",
+            "127.0.0.1:8222": "http://127.0.0.1:8222",
+        }
+        # Add LAN origins from env var
+        _lan_env = os.environ.get("MAESTRO_LAN_ORIGINS", "")
+        _allowed_origins.update(_parse_lan_origins(_lan_env))
+        logger.info("oauth_rewrite allowed_origins: %s", list(_allowed_origins.keys()))
+
+        app = OAuthURLRewriteMiddleware(app, _ISSUER_URL, allowed_origins=_allowed_origins)
 
         # ASGI middleware: request logging + registration rate-limit enforcement
         from starlette.types import ASGIApp as _ASGIApp, Receive as _Recv, Scope as _Scp, Send as _Snd

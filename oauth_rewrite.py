@@ -19,12 +19,15 @@ Solution:
     1. /.well-known/* responses → rewrites URLs in the JSON body
     2. 401 responses → rewrites resource_metadata in WWW-Authenticate header
 
-  It derives the "effective base URL" from the Host header and replaces
-  the canonical issuer URL with it. Public requests pass through unchanged.
+  It uses an allowlist of Host → base URL mappings to determine the
+  effective URL. Only allowed origins get URL rewriting; unknown hosts
+  are passed through without rewrite (they get the canonical URL — safe
+  default). This prevents Host header injection attacks.
 """
 
 import json
 import logging
+import os
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -37,19 +40,50 @@ _METADATA_PATHS = frozenset({
 })
 
 
+def _parse_lan_origins(env_val: str) -> dict[str, str]:
+    """Parse MAESTRO_LAN_ORIGINS env var into host→base_url mapping.
+
+    Format: comma-separated 'host:port=scheme' pairs.
+    Example: '10.42.69.167:8222=http,192.168.1.100:8222=http'
+    """
+    result: dict[str, str] = {}
+    for entry in env_val.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            logger.warning("invalid LAN origin entry (missing '='): %s", entry)
+            continue
+        host_port, scheme = entry.rsplit("=", 1)
+        host_port = host_port.strip()
+        scheme = scheme.strip()
+        if host_port and scheme in ("http", "https"):
+            result[host_port] = f"{scheme}://{host_port}"
+        else:
+            logger.warning("invalid LAN origin entry: %s", entry)
+    return result
+
+
 class OAuthURLRewriteMiddleware:
-    """Rewrites OAuth metadata URLs based on the incoming Host header.
+    """Rewrites OAuth metadata URLs based on an allowlist of Host → URL mappings.
+
+    Only hosts present in the allowed_origins dict get URL rewriting.
+    Unknown hosts are passed through without rewrite (safe default).
 
     Args:
         inner: The wrapped ASGI application.
         canonical_url: The static issuer URL (e.g. "https://maestro.rmstxrx.dev").
             Responses containing this URL will have it replaced when the
-            client connects via a different host.
+            client connects via an allowed non-canonical host.
+        allowed_origins: Mapping of Host header value → effective base URL.
+            The canonical host should be included (it gets pass-through).
     """
 
-    def __init__(self, inner: ASGIApp, canonical_url: str):
+    def __init__(self, inner: ASGIApp, canonical_url: str,
+                 allowed_origins: dict[str, str] | None = None):
         self.inner = inner
         self.canonical = canonical_url.rstrip("/")
+        self.allowed_origins: dict[str, str] = dict(allowed_origins or {})
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -61,14 +95,22 @@ class OAuthURLRewriteMiddleware:
         host = headers.get(b"host", b"").decode("ascii", errors="replace")
         path = scope.get("path", "")
 
-        # Determine scheme: if host matches public domain, it's behind
-        # Cloudflare TLS termination → https. Otherwise it's plain http.
-        if "maestro.rmstxrx.dev" in host:
-            # Public access — no rewrite needed
+        # Look up the host in the allowlist
+        effective_url = self.allowed_origins.get(host)
+
+        if effective_url is None:
+            # Unknown host — pass through without rewrite (safe default).
+            if host:
+                logger.warning("unknown Host header '%s' — no rewrite", host)
             await self.inner(scope, receive, send)
             return
 
-        effective = f"http://{host}"
+        # If the effective URL matches canonical, no rewrite needed.
+        if effective_url.rstrip("/") == self.canonical:
+            await self.inner(scope, receive, send)
+            return
+
+        effective = effective_url.rstrip("/")
 
         # Only intercept metadata paths and potentially auth-bearing paths
         needs_body_rewrite = path in _METADATA_PATHS
