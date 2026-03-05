@@ -42,6 +42,13 @@ from starlette.background import BackgroundTask
 from maestro_oauth import MaestroOAuthProvider
 
 logger = logging.getLogger("maestro")
+audit_logger = logging.getLogger("maestro-audit")
+
+
+def _audit(event: str, **kwargs: Any) -> None:
+    entry = {"ts": time.time(), "event": event, **kwargs}
+    audit_logger.info(json.dumps(entry))
+
 
 # ---------------------------------------------------------------------------
 # Configuration — env vars
@@ -664,6 +671,61 @@ async def _approve_route(request: Request) -> Response:
 _TRANSFER_TOKEN = os.environ.get("MAESTRO_TRANSFER_TOKEN", "")
 _MAX_TRANSFER_SIZE = int(os.environ.get("MAESTRO_MAX_TRANSFER_MB", "100")) * 1024 * 1024
 
+# Allowed base directories for transfer endpoints (path traversal prevention).
+_TRANSFER_ALLOWED_DIRS_RAW = os.environ.get("MAESTRO_TRANSFER_ALLOWED_DIRS", "~/")
+_TRANSFER_ALLOWED_DIRS: list[Path] = [
+    Path(d.strip()).expanduser().resolve()
+    for d in _TRANSFER_ALLOWED_DIRS_RAW.split(",") if d.strip()
+]
+
+# System directories always blocked unless explicitly in the allowlist.
+_SYSTEM_DIRS = frozenset({
+    "/etc", "/proc", "/sys", "/dev", "/boot", "/sbin", "/bin", "/usr", "/lib", "/var",
+})
+
+
+def _validate_transfer_path(remote_path: str, is_local: bool) -> str | None:
+    """Validate a transfer path. Returns an error message if invalid, None if OK."""
+    if not remote_path or not remote_path.strip():
+        return "remote_path is empty"
+
+    # Reject .. components (applies to both local and remote)
+    path_parts = Path(remote_path).parts
+    if ".." in path_parts:
+        return "path contains '..' components"
+
+    if is_local:
+        resolved = Path(remote_path).expanduser().resolve()
+        # Check against allowed directories
+        if not any(
+            resolved == allowed or resolved.is_relative_to(allowed)
+            for allowed in _TRANSFER_ALLOWED_DIRS
+        ):
+            return f"path is outside allowed directories"
+        # Block system directories (unless they're within an allowed dir)
+        for sys_dir in _SYSTEM_DIRS:
+            sys_path = Path(sys_dir).resolve()
+            if resolved == sys_path or resolved.is_relative_to(sys_path):
+                # Only block if no allowed dir is at or under this system dir
+                if not any(
+                    allowed == sys_path or allowed.is_relative_to(sys_path)
+                    for allowed in _TRANSFER_ALLOWED_DIRS
+                ):
+                    return f"path resolves to a protected system directory"
+    else:
+        # Remote host: can't resolve, so be conservative
+        expanded = remote_path.replace("~", "/home/_placeholder_")
+        resolved_str = str(Path(expanded).resolve())
+        for sys_dir in _SYSTEM_DIRS:
+            if resolved_str == sys_dir or resolved_str.startswith(sys_dir + "/"):
+                if not any(
+                    str(allowed).startswith(sys_dir)
+                    for allowed in _TRANSFER_ALLOWED_DIRS
+                ):
+                    return f"path targets a protected system directory"
+
+    return None
+
 
 def _transfer_auth_ok(request: Request) -> bool:
     """Validate Bearer token for transfer endpoints (constant-time)."""
@@ -702,6 +764,15 @@ async def _transfer_push(request: Request) -> Response:
     except Exception as e:
         return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
 
+    # Path sanitization
+    path_err = _validate_transfer_path(remote_path, config.is_local)
+    if path_err:
+        _audit("transfer_push_rejected", host=host, path=remote_path, reason=path_err)
+        return JSONResponse(
+            {"error": "forbidden", "detail": f"path rejected: {path_err}"},
+            status_code=403,
+        )
+
     form = await request.form()
     uploaded = form.get("file")
     if uploaded is None:
@@ -722,6 +793,7 @@ async def _transfer_push(request: Request) -> Response:
             p = Path(remote_path)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(content_bytes)
+            _audit("transfer_push_ok", host=host, path=remote_path, bytes=len(content_bytes))
             logger.info(f"transfer/push: {len(content_bytes)} bytes -> {host}:{remote_path}")
             return JSONResponse({
                 "status": "ok", "host": host,
@@ -736,6 +808,7 @@ async def _transfer_push(request: Request) -> Response:
         try:
             result = await _scp_run(host, tmp_path, remote_path, upload=True)
             if result.startswith("[OK]"):
+                _audit("transfer_push_ok", host=host, path=remote_path, bytes=len(content_bytes))
                 logger.info(f"transfer/push: {len(content_bytes)} bytes -> {host}:{remote_path} (scp)")
                 return JSONResponse({
                     "status": "ok", "host": host,
@@ -766,6 +839,15 @@ async def _transfer_pull(request: Request) -> Response:
     except Exception as e:
         return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
 
+    # Path sanitization
+    path_err = _validate_transfer_path(remote_path, config.is_local)
+    if path_err:
+        _audit("transfer_pull_rejected", host=host, path=remote_path, reason=path_err)
+        return JSONResponse(
+            {"error": "forbidden", "detail": f"path rejected: {path_err}"},
+            status_code=403,
+        )
+
     if config.is_local:
         p = Path(remote_path)
         if not p.is_file():
@@ -778,6 +860,7 @@ async def _transfer_pull(request: Request) -> Response:
                 {"error": "too_large", "detail": f"file exceeds {_MAX_TRANSFER_SIZE // (1024*1024)}MB limit"},
                 status_code=413,
             )
+        _audit("transfer_pull_ok", host=host, path=remote_path)
         logger.info(f"transfer/pull: {host}:{remote_path} -> caller")
         return FileResponse(remote_path, filename=p.name, media_type="application/octet-stream")
     else:
@@ -794,6 +877,7 @@ async def _transfer_pull(request: Request) -> Response:
                     {"error": "too_large", "detail": f"file exceeds {_MAX_TRANSFER_SIZE // (1024*1024)}MB limit"},
                     status_code=413,
                 )
+            _audit("transfer_pull_ok", host=host, path=remote_path)
             logger.info(f"transfer/pull: {host}:{remote_path} -> caller (scp)")
             return FileResponse(
                 tmp_path, filename=Path(remote_path).name,
