@@ -6,8 +6,9 @@ and bearer-token verification are handled by the SDK's built-in auth system.
 
 Security layers:
   - Dynamic registration rate-limited (10 per minute).
-  - Claude.ai (detected by redirect_uri) is auto-approved — the user is
-    already authenticated in their Anthropic account.
+  - Trusted client IDs (from MAESTRO_TRUSTED_CLIENT_IDS env var) are
+    auto-approved — no PIN required. Use this for clients like Claude.ai
+    where the user is already authenticated in their provider's account.
   - All other MCP clients go through a consent page with PIN gate.
   - Tokens are opaque random strings stored in-memory.
 """
@@ -46,7 +47,9 @@ REFRESH_TOKEN_EXPIRY = 30 * 86400  # 30 days
 AUTH_CODE_TTL = 300  # 5 minutes
 
 AUTHORIZE_PIN_HASH = os.environ.get("MAESTRO_AUTHORIZE_PIN_HASH")
-CLAUDE_AI_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+
+# Trusted client IDs that bypass the PIN gate (comma-separated env var).
+_TRUSTED_CLIENT_IDS_RAW = os.environ.get("MAESTRO_TRUSTED_CLIENT_IDS", "")
 
 
 def _audit(event: str, **kwargs: Any) -> None:
@@ -57,7 +60,7 @@ def _audit(event: str, **kwargs: Any) -> None:
 class MaestroOAuthProvider:
     """OAuth 2.0 provider for Maestro MCP.
 
-    Claude.ai → auto-approve (redirect_uri gated).
+    Trusted client IDs (MAESTRO_TRUSTED_CLIENT_IDS) → auto-approve.
     Other clients → consent page + PIN gate.
     Registration rate-limited to 10/min.
     """
@@ -78,6 +81,14 @@ class MaestroOAuthProvider:
         self._pin_fail_timestamps: list[float] = []
         self._PIN_FAIL_LIMIT = 5
         self._PIN_FAIL_WINDOW = 300  # 5 minutes
+
+        # Trusted client IDs that skip the PIN gate.
+        self.trusted_client_ids: set[str] = {
+            cid.strip() for cid in _TRUSTED_CLIENT_IDS_RAW.split(",")
+            if cid.strip()
+        }
+        if self.trusted_client_ids:
+            logger.info("trusted_client_ids: %s", self.trusted_client_ids)
 
     # --- OAuthAuthorizationServerProvider protocol ---
 
@@ -121,13 +132,14 @@ class MaestroOAuthProvider:
         for aid in expired:
             del self.pending_approvals[aid]
 
-        # Claude.ai auto-approval: user is already authenticated in their
-        # Anthropic account, so we skip the PIN gate.
-        if redirect_str == CLAUDE_AI_CALLBACK:
+        # Trusted client auto-approval: clients whose client_id is in the
+        # MAESTRO_TRUSTED_CLIENT_IDS allowlist skip the PIN gate.
+        if client.client_id in self.trusted_client_ids:
             code = self._store_auth_code(client, params)
             _audit("authorize_auto_approved", client_id=client.client_id,
-                   reason="claude_ai_redirect")
-            logger.info("authorize_auto: client=%s (Claude.ai)", client.client_id)
+                   reason="trusted_client_id")
+            logger.info("authorize_auto: client=%s (trusted client_id)",
+                        client.client_id)
             return construct_redirect_uri(
                 redirect_str, code=code, state=params.state,
             )
