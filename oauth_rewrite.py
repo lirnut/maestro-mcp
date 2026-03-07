@@ -15,9 +15,11 @@ Problem:
   the resource is https://maestro.rmstxrx.dev/mcp, the client rejects it.
 
 Solution:
-  This middleware intercepts:
+  This middleware intercepts ALL responses for non-canonical hosts and:
     1. /.well-known/* responses → rewrites URLs in the JSON body
-    2. 401 responses → rewrites resource_metadata in WWW-Authenticate header
+    2. 3xx responses → rewrites Location headers (authorize → approve redirects)
+    3. 401 responses → rewrites resource_metadata in WWW-Authenticate header
+    4. HTML responses → rewrites canonical URLs in the body (approve page forms)
 
   It uses an allowlist of Host → base URL mappings to determine the
   effective URL. Only allowed origins get URL rewriting; unknown hosts
@@ -65,7 +67,13 @@ def _parse_lan_origins(env_val: str) -> dict[str, str]:
 
 
 class OAuthURLRewriteMiddleware:
-    """Rewrites OAuth metadata URLs based on an allowlist of Host → URL mappings.
+    """Rewrites OAuth/consent URLs based on an allowlist of Host → URL mappings.
+
+    Intercepts all responses for non-canonical hosts and rewrites:
+      - JSON body in well-known metadata paths
+      - Location headers on 3xx redirects
+      - WWW-Authenticate headers on 401 responses
+      - HTML body content (form actions, links in consent pages)
 
     Only hosts present in the allowed_origins dict get URL rewriting.
     Unknown hosts are passed through without rewrite (safe default).
@@ -93,7 +101,6 @@ class OAuthURLRewriteMiddleware:
         # Derive the effective base URL from the Host header.
         headers = dict(scope.get("headers", []))
         host = headers.get(b"host", b"").decode("ascii", errors="replace")
-        path = scope.get("path", "")
 
         # Look up the host in the allowlist
         effective_url = self.allowed_origins.get(host)
@@ -111,30 +118,23 @@ class OAuthURLRewriteMiddleware:
             return
 
         effective = effective_url.rstrip("/")
+        canonical_bytes = self.canonical.encode()
+        effective_bytes = effective.encode()
+        path = scope.get("path", "")
 
-        # Only intercept metadata paths and potentially auth-bearing paths
-        needs_body_rewrite = path in _METADATA_PATHS
-        needs_header_rewrite = True  # any path can return 401
-
-        if not needs_body_rewrite and not needs_header_rewrite:
-            await self.inner(scope, receive, send)
-            return
-
-        # Buffer the response to rewrite URLs
-        response_started = False
+        # Buffer ALL responses for non-canonical hosts so we can rewrite
+        # Location headers, body content, and WWW-Authenticate headers.
         status_code = 0
         response_headers: list[tuple[bytes, bytes]] = []
         body_chunks: list[bytes] = []
 
         async def rewrite_send(message: dict) -> None:
-            nonlocal response_started, status_code, response_headers, body_chunks
+            nonlocal status_code, response_headers, body_chunks
 
             if message["type"] == "http.response.start":
                 status_code = message.get("status", 0)
                 response_headers = list(message.get("headers", []))
-                response_started = True
-                # Don't forward yet — wait for body to decide on rewrites
-                return
+                return  # Buffer — wait for body
 
             if message["type"] == "http.response.body":
                 body = message.get("body", b"")
@@ -144,31 +144,25 @@ class OAuthURLRewriteMiddleware:
                 if more_body:
                     return  # Keep buffering
 
-                # Full response collected — apply rewrites
+                # --- Full response collected — apply rewrites ---
                 full_body = b"".join(body_chunks)
 
-                if needs_body_rewrite and path in _METADATA_PATHS:
-                    full_body = full_body.replace(
-                        self.canonical.encode(),
-                        effective.encode(),
-                    )
+                # Body rewrite: metadata JSON + HTML content (approve pages)
+                if canonical_bytes in full_body:
+                    full_body = full_body.replace(canonical_bytes, effective_bytes)
 
-                if status_code == 401:
-                    # Rewrite www-authenticate header
-                    new_headers = []
-                    for k, v in response_headers:
-                        if k.lower() == b"www-authenticate":
-                            v = v.replace(
-                                self.canonical.encode(),
-                                effective.encode(),
-                            )
-                        new_headers.append((k, v))
-                    response_headers = new_headers
-
-                # Fix content-length after body rewrite
+                # Header rewrites
                 new_headers = []
                 for k, v in response_headers:
-                    if k.lower() == b"content-length":
+                    kl = k.lower()
+                    # 3xx: rewrite Location header
+                    if kl == b"location" and 300 <= status_code < 400:
+                        v = v.replace(canonical_bytes, effective_bytes)
+                    # 401: rewrite WWW-Authenticate
+                    elif kl == b"www-authenticate" and status_code == 401:
+                        v = v.replace(canonical_bytes, effective_bytes)
+                    # Fix content-length after body rewrite
+                    elif kl == b"content-length":
                         v = str(len(full_body)).encode()
                     new_headers.append((k, v))
 

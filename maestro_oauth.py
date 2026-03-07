@@ -416,7 +416,29 @@ class MaestroOAuthProvider:
 # HTML templates
 # ---------------------------------------------------------------------------
 
-def _approve_page(client_name: str, approval_id: str, csrf_token: str, host_names: list[str] | None = None) -> str:
+# Shared CSS for the dark card UI. Embedded in each page via f-string.
+_CARD_CSS = (
+    "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;"
+    " background: #0a0a1a; color: #e0e0e0;"
+    " display: flex; justify-content: center; align-items: center;"
+    " min-height: 100vh; margin: 0; }"
+    " .card { background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;"
+    " padding: 2rem; max-width: 400px; width: 90%;"
+    " box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); }"
+    " h1 { font-size: 1.3rem; margin: 0 0 0.5rem 0; color: #00d4ff; }"
+    " a { color: #00d4ff; }"
+    " @keyframes spin { to { transform: rotate(360deg); } }"
+    " .spinner { display: inline-block; width: 1.2rem; height: 1.2rem;"
+    " border: 2px solid #2a2a4a; border-top-color: #00d4ff;"
+    " border-radius: 50%; animation: spin 0.8s linear infinite;"
+    " vertical-align: middle; margin-right: 0.5rem; }"
+    " @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }"
+    " .fade-in { animation: fadeIn 0.3s ease-in; }"
+)
+
+
+def _approve_page(client_name: str, approval_id: str, csrf_token: str,
+                  host_names: list[str] | None = None) -> str:
     safe_name = html_mod.escape(client_name)
     safe_id = html_mod.escape(approval_id)
     safe_csrf = html_mod.escape(csrf_token)
@@ -424,34 +446,33 @@ def _approve_page(client_name: str, approval_id: str, csrf_token: str, host_name
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Maestro — Authorize</title>
+    <title>Maestro \u2014 Authorize</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a1a; color: #e0e0e0;
-            display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; margin: 0; }}
-        .card {{ background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
-            padding: 2rem; max-width: 400px; width: 90%;
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); }}
-        h1 {{ font-size: 1.3rem; margin: 0 0 0.5rem 0; color: #00d4ff; }}
+        {_CARD_CSS}
         .client {{ color: #ff6b9d; font-weight: 600; }}
         .perms {{ background: #12122a; border: 1px solid #2a2a4a; border-radius: 8px;
             padding: 1rem; margin: 1rem 0; font-size: 0.9rem; }}
         .perms li {{ margin: 0.3rem 0; }}
         .buttons {{ display: flex; gap: 1rem; margin-top: 1.5rem; }}
         button {{ flex: 1; padding: 0.75rem; border: none; border-radius: 8px;
-            font-size: 1rem; cursor: pointer; font-weight: 600; }}
+            font-size: 1rem; cursor: pointer; font-weight: 600;
+            transition: background 0.15s; }}
         .approve {{ background: #00d4ff; color: #0a0a1a; }}
         .approve:hover {{ background: #00b8e6; }}
         .deny {{ background: #2a2a4a; color: #e0e0e0; }}
         .deny:hover {{ background: #3a3a5a; }}
         .pin-field {{ margin: 1rem 0 0.5rem 0; }}
         .pin-field label {{ font-size: 0.9rem; color: #aaa; }}
+        .pin-input {{ width: 100%; padding: 0.6rem; border: 1px solid #2a2a4a;
+            border-radius: 6px; background: #12122a; color: #e0e0e0;
+            font-family: monospace; font-size: 1rem; margin-top: 0.4rem;
+            box-sizing: border-box; }}
+        .pin-input:focus {{ outline: none; border-color: #00d4ff; }}
     </style>
 </head>
 <body>
-    <div class="card">
+    <div class="card fade-in">
         <h1>Maestro</h1>
         <p><span class="client">{safe_name}</span> wants access to Maestro.</p>
         <div class="perms">
@@ -462,20 +483,19 @@ def _approve_page(client_name: str, approval_id: str, csrf_token: str, host_name
                 <li>Transfer files between machines</li>
             </ul>
         </div>
-        <form method="POST" action="/approve">
+        <form id="authForm" method="POST" action="/approve">
             <input type="hidden" name="id" value="{safe_id}">
             <input type="hidden" name="csrf_token" value="{safe_csrf}">
+            <input type="hidden" id="actionField" name="action" value="approve">
             <div class="pin-field">
                 <label for="pin">Authorization PIN:</label>
                 <input type="password" id="pin" name="pin" placeholder="Enter PIN"
-                    autocomplete="off" required
-                    style="width:100%; padding:0.6rem; border:1px solid #2a2a4a;
-                    border-radius:6px; background:#12122a; color:#e0e0e0;
-                    font-family:monospace; font-size:1rem; margin-top:0.4rem;">
+                    autocomplete="off" required class="pin-input" autofocus>
             </div>
             <div class="buttons">
-                <button type="submit" name="action" value="approve" class="approve">Approve</button>
-                <button type="submit" name="action" value="deny" class="deny">Deny</button>
+                <button type="submit" class="approve">Approve</button>
+                <button type="button" class="deny"
+                    onclick="document.getElementById('actionField').value='deny';document.getElementById('authForm').submit();">Deny</button>
             </div>
         </form>
     </div>
@@ -484,37 +504,59 @@ def _approve_page(client_name: str, approval_id: str, csrf_token: str, host_name
 
 
 def _redirect_page(url: str) -> str:
-    # HTML-escaped URL for attributes (href, meta content) where the
-    # browser decodes &amp; → &.
+    """Success page after OAuth approval.
+
+    Fires the callback in a hidden iframe so the token exchange
+    completes server-to-server, while the visible page shows success
+    and attempts to close the tab.
+    """
     html_url = html_mod.escape(url, quote=True)
-    # JSON-encoded URL for <script> context where HTML entities are NOT
-    # decoded — use json.dumps to produce a safe JS string literal.
-    js_url = json.dumps(url)  # includes surrounding quotes
+    js_url = json.dumps(url)
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Maestro — Redirecting</title>
-    <meta http-equiv="refresh" content="0;url={html_url}">
+    <title>Maestro \u2014 Authorized</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a1a; color: #e0e0e0;
-            display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; margin: 0; }}
-        .card {{ background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
-            padding: 2rem; max-width: 400px; width: 90%;
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); text-align: center; }}
-        h1 {{ font-size: 1.3rem; color: #00d4ff; margin: 0 0 1rem 0; }}
-        a {{ color: #00d4ff; }}
+        {_CARD_CSS}
+        .card {{ text-align: center; }}
+        .check {{ font-size: 2.5rem; margin-bottom: 0.5rem; }}
+        .status {{ margin: 1rem 0; font-size: 0.95rem; color: #aaa; }}
+        .close-hint {{ margin-top: 1rem; font-size: 0.85rem; color: #666; }}
     </style>
 </head>
 <body>
-    <div class="card">
-        <h1>Approved</h1>
-        <p>Redirecting...</p>
-        <p style="margin-top:1rem"><a href="{html_url}">Click here if not redirected</a></p>
+    <div class="card fade-in">
+        <div class="check">\u2705</div>
+        <h1>Authorized</h1>
+        <p class="status" id="status"><span class="spinner"></span>Completing handshake\u2026</p>
+        <p class="close-hint" id="closeHint" style="display:none;">
+            You can <a href="javascript:window.close()">close this tab</a>
+            and return to your client.
+        </p>
     </div>
-    <script>window.location.replace({js_url});</script>
+    <script>
+        // Fire callback in hidden iframe (token exchange is server-to-server).
+        var cb = document.createElement('iframe');
+        cb.style.display = 'none';
+        cb.src = {js_url};
+        document.body.appendChild(cb);
+
+        // After handshake delay, show completion and try to close.
+        setTimeout(function() {{
+            document.getElementById('status').textContent = 'Handshake complete.';
+            document.getElementById('closeHint').style.display = 'block';
+            try {{ window.close(); }} catch(e) {{}}
+            try {{ window.open('', '_self').close(); }} catch(e) {{}}
+        }}, 2000);
+
+        // If still open after 4s, fall back to direct redirect.
+        setTimeout(function() {{
+            if (!document.hidden) {{
+                window.location.replace({js_url});
+            }}
+        }}, 4000);
+    </script>
 </body>
 </html>"""
 
@@ -525,25 +567,21 @@ def _error_page(title: str, message: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Maestro — {safe_title}</title>
+    <title>Maestro \u2014 {safe_title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0a0a1a; color: #e0e0e0;
-            display: flex; justify-content: center; align-items: center;
-            min-height: 100vh; margin: 0; }}
-        .card {{ background: #1a1a2e; border: 1px solid #ff4444; border-radius: 12px;
-            padding: 2rem; max-width: 400px; width: 90%;
-            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5); text-align: center; }}
-        h1 {{ font-size: 1.3rem; color: #ff4444; margin: 0 0 1rem 0; }}
-        a {{ color: #00d4ff; }}
+        {_CARD_CSS}
+        .card {{ border-color: #ff4444; text-align: center; }}
+        h1 {{ color: #ff4444; }}
     </style>
 </head>
 <body>
-    <div class="card">
+    <div class="card fade-in">
         <h1>{safe_title}</h1>
         <p>{safe_msg}</p>
-        <p style="margin-top:1.5rem"><a href="javascript:window.close()">Close this tab</a></p>
+        <p style="margin-top:1.5rem">
+            <a href="javascript:window.close()">Close this tab</a>
+        </p>
     </div>
 </body>
 </html>"""

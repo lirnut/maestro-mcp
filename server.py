@@ -1678,7 +1678,8 @@ async def codex_execute(
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
 
-    Codex runs in full-auto mode. It can read files, edit code, run
+    Codex runs unsandboxed (bypasses workspace-write sandbox that deadlocks
+    Rust/Tokio runtimes like LanceDB). It can read files, edit code, run
     commands, and execute tests. Best for: feature implementation,
     refactoring, bug fixes, test generation.
 
@@ -1701,7 +1702,7 @@ async def codex_execute(
         model_flag = f"--model {shlex.quote(model)} " if model else ""
         effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
         escaped_prompt = shlex.quote(prompt)
-        cli_cmd = f"codex exec --full-auto --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+        cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
         logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
         rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
         return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
