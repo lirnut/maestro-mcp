@@ -61,6 +61,24 @@ from maestro.transport import (
     teardown_all_hosts,
     warmup_all_hosts,
 )
+from maestro.tools.orchestra import (
+    AGENT_SCOPE_PREFIX,
+    TASK_REGISTRY,
+    TaskState,
+    _REGISTRY_LOCK,
+    _auto_promote,
+    _extract_gemini_response,
+    _orchestra_build_result,
+    _orchestra_output_dir,
+    _orchestra_output_path,
+    _orchestra_run_cli,
+    _orchestra_run_cli_raw,
+    _orchestra_task_id,
+    _orchestra_truncate,
+    cancel_eviction_loop,
+    configure_orchestra,
+    start_eviction_loop,
+)
 from maestro_oauth import MaestroOAuthProvider
 
 logger = logging.getLogger("maestro")
@@ -77,16 +95,6 @@ def _audit(event: str, **kwargs: Any) -> None:
 # ---------------------------------------------------------------------------
 CONFIG = MaestroConfig.from_env()
 MAX_INLINE_OUTPUT = CONFIG.max_inline_output
-AGENT_SCOPE_PREFIX = (
-    "SCOPE CONSTRAINTS (non-negotiable):\n"
-    "1. ONLY modify files and code directly related to the task below.\n"
-    "2. Do NOT refactor, clean up, or improve code outside the task scope.\n"
-    "3. Do NOT run tests unless explicitly asked.\n"
-    "4. Do NOT write or update documentation unless explicitly asked.\n"
-    "5. When done, output ONLY: files changed + one-sentence summary per file.\n"
-    "6. If the task is ambiguous, do the MINIMUM viable interpretation.\n\n"
-    "TASK:\n"
-)
 
 # ---------------------------------------------------------------------------
 # Host registry
@@ -194,7 +202,6 @@ _oauth_provider = MaestroOAuthProvider(
 )
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Execution/transport helpers extracted to maestro.local and maestro.transport
 # ---------------------------------------------------------------------------
 
@@ -216,11 +223,7 @@ def _ps_quote(value: str) -> str:
 
 
 def _local_host_hint(tool_name: str, host_name: str) -> str:
-    """Soft guardrail — kept as no-op to avoid touching 6 call sites.
-
-    The local-tool-preference guidance lives in _build_instructions() instead,
-    where it's seen once per session rather than on every single tool result.
-    """
+    """Soft guardrail — kept as no-op to avoid touching call sites."""
     return ""
 
 
@@ -262,27 +265,18 @@ configure_local(
     config=CONFIG,
     format_result=_format_result,
 )
-
-
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def maestro_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-    logger.info("maestro: warming up connections...")
-    results = await warmup_all_hosts()
-    connected = sum(1 for v in results.values() if v)
-    total = len(results)
-    logger.info(f"maestro: {connected}/{total} hosts connected")
-    try:
-        yield {"hosts": HOSTS, "warmup_results": results}
-    finally:
-        try:
-            logger.info("maestro: shutting down, closing connections...")
-            await teardown_all_hosts()
-        except Exception:
-            logger.exception("maestro: error during teardown")
+configure_orchestra(
+    config=CONFIG,
+    resolve_host=_resolve_host,
+    wrap_command=_wrap_command,
+    format_result=_format_result,
+    update_host_status=_update_host_status,
+    host_status=HostStatus,
+    ensure_connection=_ensure_connection,
+    teardown_connection=_teardown_connection,
+    async_run=_async_run,
+    is_transient_failure=_is_transient_failure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -317,16 +311,10 @@ mcp = FastMCP(
         revocation_options=RevocationOptions(enabled=True),
         required_scopes=["maestro"],
     ),
-    # Disable DNS rebinding protection — we're behind Cloudflare Tunnel,
-    # so the Host header is the public domain, not localhost.
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
     instructions=_build_instructions(),
-    # NOTE: No per-session lifespan — SSH lifecycle is managed at the server
-    # level by _serve_with_maestro_lifecycle(). A per-session lifespan would
-    # tear down ALL SSH ControlMasters when any single session disconnects,
-    # breaking other sessions and requiring re-warmup.
 )
 
 
@@ -337,22 +325,11 @@ async def _approve_route(request: Request) -> Response:
 
 
 # --- FILE TRANSFER RELAY ---
-# Zero-context-cost file push/pull for sandboxed agents (e.g. Claude.ai).
-# Bytes flow over HTTP, never entering the LLM context window.
-#
-# Auth: Bearer token from MAESTRO_TRANSFER_TOKEN env var (constant-time comparison).
-#
-#   POST /transfer/push?host=<host>&remote_path=<path>  (multipart upload)
-#   GET  /transfer/pull?host=<host>&remote_path=<path>  (file download)
-# ---------------------------------------------------------------------------
-
-# Allowed base directories for transfer endpoints (path traversal prevention).
 _TRANSFER_ALLOWED_DIRS: list[Path] = [
     Path(d.strip()).expanduser().resolve()
     for d in CONFIG.transfer_allowed_dirs_raw.split(",") if d.strip()
 ]
 
-# System directories always blocked unless explicitly in the allowlist.
 _SYSTEM_DIRS = frozenset({
     "/etc", "/proc", "/sys", "/dev", "/boot", "/sbin", "/bin", "/usr", "/lib", "/var",
 })
@@ -363,31 +340,26 @@ def _validate_transfer_path(remote_path: str, is_local: bool) -> str | None:
     if not remote_path or not remote_path.strip():
         return "remote_path is empty"
 
-    # Reject .. components (applies to both local and remote)
     path_parts = Path(remote_path).parts
     if ".." in path_parts:
         return "path contains '..' components"
 
     if is_local:
         resolved = Path(remote_path).expanduser().resolve()
-        # Check against allowed directories
         if not any(
             resolved == allowed or resolved.is_relative_to(allowed)
             for allowed in _TRANSFER_ALLOWED_DIRS
         ):
             return f"path is outside allowed directories"
-        # Block system directories (unless they're within an allowed dir)
         for sys_dir in _SYSTEM_DIRS:
             sys_path = Path(sys_dir).resolve()
             if resolved == sys_path or resolved.is_relative_to(sys_path):
-                # Only block if no allowed dir is at or under this system dir
                 if not any(
                     allowed == sys_path or allowed.is_relative_to(sys_path)
                     for allowed in _TRANSFER_ALLOWED_DIRS
                 ):
                     return f"path resolves to a protected system directory"
     else:
-        # Remote host: can't resolve, so be conservative
         expanded = remote_path.replace("~", "/home/_placeholder_")
         resolved_str = str(Path(expanded).resolve())
         for sys_dir in _SYSTEM_DIRS:
@@ -438,7 +410,6 @@ async def _transfer_push(request: Request) -> Response:
     except Exception as e:
         return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
 
-    # Path sanitization
     path_err = _validate_transfer_path(remote_path, config.is_local)
     if path_err:
         _audit("transfer_push_rejected", host=host, path=remote_path, reason=path_err)
@@ -513,7 +484,6 @@ async def _transfer_pull(request: Request) -> Response:
     except Exception as e:
         return JSONResponse({"error": "bad_request", "detail": str(e)}, status_code=400)
 
-    # Path sanitization
     path_err = _validate_transfer_path(remote_path, config.is_local)
     if path_err:
         _audit("transfer_pull_rejected", host=host, path=remote_path, reason=path_err)
@@ -594,7 +564,7 @@ async def maestro_exec(
                 parts.append("sudo")
             parts.append(command)
             full_cmd = " ".join(parts)
-            return _local_host_hint("maestro_exec", host) + await _local_run(full_cmd, timeout=timeout, cwd=cwd)
+            return await _local_run(full_cmd, timeout=timeout, cwd=cwd)
         full_cmd = _wrap_command(config, command, cwd, sudo)
         return await _ssh_run(host, [full_cmd], timeout=timeout)
 
@@ -632,7 +602,7 @@ async def maestro_script(
     async def _execute() -> str:
         config = _resolve_host(host)
         if config.is_local:
-            return _local_host_hint("maestro_script", host) + await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
+            return await _local_script(script, timeout=timeout, cwd=cwd, sudo=sudo)
         lines = []
         if config.shell == HostShell.POWERSHELL:
             lines.append("$ErrorActionPreference = 'Stop'")
@@ -659,158 +629,6 @@ async def maestro_script(
     )
 
 
-# ---------------------------------------------------------------------------
-# Background command dispatch — fire-and-forget shell commands
-# ---------------------------------------------------------------------------
-
-def _bg_output_dir() -> Path:
-    """Ensure bg output directory exists."""
-    CONFIG.bg_output_dir.mkdir(parents=True, exist_ok=True)
-    return CONFIG.bg_output_dir
-
-
-def _bg_output_path(task_id: str) -> Path:
-    """Generate output file path for a background command."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return _bg_output_dir() / f"bg_{ts}_{task_id}.txt"
-
-
-@mcp.tool()
-async def maestro_bg(
-    host: str,
-    command: str,
-    cwd: str | None = None,
-    sudo: bool = False,
-    timeout: int = CONFIG.bg_default_timeout,
-) -> str:
-    """Run a shell command in the background. Returns a task_id immediately.
-
-    Use agent_poll(task_id) to check status and get the result.
-    Use maestro_bg_log(task_id) to tail the output while still running.
-
-    Best for: docker pull, model downloads, long builds, anything that
-    takes more than a few seconds. Prevents tool-call timeouts.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        command: Shell command to execute
-        cwd: Working directory to cd into before running the command
-        sudo: If True, prepend sudo (assumes passwordless sudo on target)
-        timeout: Max seconds before the background task is killed (default 300)
-    """
-    config = _resolve_host(host)
-    task_id = secrets.token_hex(8)
-    output_file = _bg_output_path(task_id)
-    now = datetime.now(timezone.utc)
-
-    ts = TaskState(
-        task_id=task_id,
-        agent="bg",
-        host=host,
-        prompt=command,
-        status="running",
-        started_at=now,
-        output_file=output_file,
-    )
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    async def _run() -> None:
-        try:
-            if config.is_local:
-                full_cmd = command
-                if sudo:
-                    full_cmd = f"sudo {command}"
-                result_text = await _local_run(full_cmd, timeout=timeout, cwd=cwd)
-            else:
-                full_cmd = _wrap_command(config, command, cwd, sudo)
-                result_text = await _ssh_run(host, [full_cmd], timeout=timeout)
-
-            # Save full output to disk
-            output_file.write_text(result_text, encoding="utf-8")
-
-            # Build inline result (truncated if needed)
-            truncated, was_truncated = _orchestra_truncate(result_text)
-            result = {
-                "task_id": task_id,
-                "host": host,
-                "command": command[:200],
-                "status": "done",
-                "output": truncated,
-                "output_file": str(output_file) if was_truncated else None,
-            }
-            ts.status = "done"
-            ts.result_json = json.dumps(result)
-        except asyncio.CancelledError:
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "task_id": task_id, "host": host, "status": "timeout",
-                "error": f"Killed after {timeout}s timeout",
-            })
-        except Exception as exc:
-            logger.exception(f"maestro_bg [{task_id}] failed on {host}")
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "task_id": task_id, "host": host, "status": "failed",
-                "error": str(exc),
-            })
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-            ts._done_event.set()
-
-    ts.asyncio_task = asyncio.create_task(_run())
-    logger.info(f"maestro_bg on {host} [{task_id}]: {command[:80]}...")
-
-    return json.dumps({
-        "task_id": task_id,
-        "host": host,
-        "status": "running",
-    })
-
-
-@mcp.tool()
-async def maestro_bg_log(
-    task_id: str,
-    tail: int = 50,
-) -> str:
-    """Read recent output from a background command (running or finished).
-
-    Note: Output is captured after the command completes (SSH collects all
-    output before returning). For real-time visibility into long commands,
-    have the command write its own log file and read it with maestro_read:
-        maestro_bg(host, "docker pull image > /tmp/pull.log 2>&1")
-        maestro_read(host, "/tmp/pull.log", tail=20)
-
-    Args:
-        task_id: Task ID returned by maestro_bg.
-        tail: Number of lines from the end to return (default 50).
-    """
-    async with _REGISTRY_LOCK:
-        ts = TASK_REGISTRY.get(task_id)
-    if ts is None:
-        return json.dumps({"error": f"Task '{task_id}' not found"})
-    if ts.output_file is None or not ts.output_file.exists():
-        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
-        return json.dumps({
-            "task_id": task_id,
-            "status": ts.status,
-            "elapsed_seconds": round(elapsed, 1),
-            "log": "(no output yet — command still running)",
-        })
-    try:
-        lines = ts.output_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        selected = lines[-tail:] if len(lines) > tail else lines
-        return json.dumps({
-            "task_id": task_id,
-            "status": ts.status,
-            "total_lines": len(lines),
-            "showing_last": len(selected),
-            "log": "\n".join(selected),
-        })
-    except Exception as exc:
-        return json.dumps({"error": str(exc), "task_id": task_id})
-
-
 @mcp.tool()
 async def maestro_read(
     host: str, path: str, head: int | None = None,
@@ -829,7 +647,7 @@ async def maestro_read(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_read", host) + _local_read_file(path, head=head, tail=tail)
+        return _local_read_file(path, head=head, tail=tail)
     if config.shell == HostShell.POWERSHELL:
         if head:
             cmd = f"Get-Content -LiteralPath {_ps_quote(path)} -TotalCount {head}"
@@ -867,7 +685,7 @@ async def maestro_write(
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_write", host) + _local_write_file(path, content, append=append, sudo=sudo)
+        return _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
         if append:
             cmd = f"$input | Out-File -Append -LiteralPath {_ps_quote(path)}"
@@ -900,7 +718,7 @@ async def maestro_upload(host: str, local_path: str, remote_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_upload", host) + _local_copy(local_path, remote_path, upload=True)
+        return _local_copy(local_path, remote_path, upload=True)
     return await _scp_run(host, local_path, remote_path, upload=True)
 
 
@@ -917,7 +735,7 @@ async def maestro_download(host: str, remote_path: str, local_path: str) -> str:
     """
     config = _resolve_host(host)
     if config.is_local:
-        return _local_host_hint("maestro_download", host) + _local_copy(remote_path, local_path, upload=False)
+        return _local_copy(remote_path, local_path, upload=False)
     return await _scp_run(host, remote_path, local_path, upload=False)
 
 
@@ -962,337 +780,7 @@ async def maestro_status() -> str:
 
 # ---------------------------------------------------------------------------
 # Agent Orchestra — CLI agent dispatch tools
-#
-# Higher-level tools that dispatch tasks to Codex CLI and Gemini CLI.
-# Claude acts as stateful coordinator; these CLIs are stateless executors.
-#
-# Design principles:
-#   - Output discipline: full output saved to disk, structured summary returned
-#   - Fat prompt in, structured result out (CLIs are stateless)
-#   - Scope discipline: tight, bounded prompts for Codex
-#   - File-mediated handoffs: large outputs on disk, read selectively
 # ---------------------------------------------------------------------------
-
-# Auto-promote: if a tool call doesn't finish within CONFIG.block_timeout_default
-# seconds, it's promoted to a background task and returns a task_id instead
-# of blocking the conversation. The subprocess keeps running up to its
-# full timeout. Use agent_poll(task_id, wait=N) to long-poll the result.
-
-
-@dataclass
-class TaskState:
-    task_id: str
-    agent: str            # "codex" | "gemini" | "claude" | "exec" | "script" | "bg"
-    host: str
-    prompt: str
-    status: str           # "running" | "done" | "failed" | "timeout"
-    started_at: datetime
-    finished_at: datetime | None = None
-    asyncio_task: asyncio.Task | None = None
-    output_file: Path | None = None
-    result_json: str | None = None
-    _done_event: asyncio.Event = field(default_factory=asyncio.Event)
-
-
-TASK_REGISTRY: dict[str, TaskState] = {}
-_REGISTRY_LOCK = asyncio.Lock()
-_EVICTION_TASK: asyncio.Task | None = None
-
-
-async def _evict_stale_tasks() -> None:
-    """Remove completed tasks older than CONFIG.task_eviction_seconds from registry.
-
-    Cancels any lingering asyncio tasks and cleans up old output files.
-    """
-    now = datetime.now(timezone.utc)
-    async with _REGISTRY_LOCK:
-        stale = [
-            tid for tid, ts in TASK_REGISTRY.items()
-            if ts.finished_at and (now - ts.finished_at).total_seconds() > CONFIG.task_eviction_seconds
-        ]
-        for tid in stale:
-            ts = TASK_REGISTRY.pop(tid)
-            # Cancel lingering asyncio task (should already be done, but be safe)
-            if ts.asyncio_task and not ts.asyncio_task.done():
-                ts.asyncio_task.cancel()
-            # Delete output files older than retention period
-            if ts.output_file and ts.output_file.exists():
-                try:
-                    age = (now - ts.started_at).total_seconds()
-                    if age > CONFIG.task_output_retention_seconds:
-                        ts.output_file.unlink()
-                except OSError:
-                    pass
-    if stale:
-        logger.info(f"Orchestra: evicted {len(stale)} stale tasks from registry")
-
-
-async def _periodic_eviction() -> None:
-    """Background loop that evicts stale tasks every 10 minutes."""
-    while True:
-        await asyncio.sleep(600)
-        try:
-            await _evict_stale_tasks()
-        except Exception:
-            logger.exception("Orchestra: periodic eviction failed")
-
-
-def _orchestra_output_dir() -> Path:
-    """Ensure orchestra output directory exists."""
-    CONFIG.orchestra_output_dir.mkdir(parents=True, exist_ok=True)
-    return CONFIG.orchestra_output_dir
-
-
-def _orchestra_output_path(agent: str, task_id: str) -> Path:
-    """Generate a unique output file path for a CLI invocation."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return _orchestra_output_dir() / f"{agent}_{ts}_{task_id}.txt"
-
-
-def _orchestra_task_id(prompt: str) -> str:
-    """Short hash of prompt for file naming."""
-    return hashlib.sha256(prompt.encode()).hexdigest()[:8]
-
-
-def _orchestra_truncate(text: str, max_len: int = CONFIG.max_inline_output) -> tuple[str, bool]:
-    """Truncate text, return (text, was_truncated)."""
-    if len(text) <= max_len:
-        return text, False
-    return text[:max_len] + "\n... [truncated]", True
-
-
-def _extract_gemini_response(raw_output: str) -> str:
-    """Extract response text from Gemini CLI JSON envelope.
-
-    Parses the JSON output, extracts the 'response' field, and appends
-    token usage summary if stats are available.
-    """
-    try:
-        parsed = json.loads(raw_output)
-        if "response" not in parsed:
-            return raw_output
-        extracted = parsed["response"]
-        if "stats" in parsed:
-            models_info = parsed["stats"].get("models", {})
-            token_summary = {
-                m: {
-                    "prompt": d.get("tokens", {}).get("prompt", 0),
-                    "output": d.get("tokens", {}).get("candidates", 0),
-                }
-                for m, d in models_info.items()
-            }
-            extracted += f"\n\n[Tokens: {json.dumps(token_summary)}]"
-        return extracted
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return raw_output
-
-
-def _orchestra_build_result(
-    agent: str,
-    host: str,
-    prompt: str,
-    raw_output: str,
-    return_code: int,
-    output_file: Path,
-) -> str:
-    """
-    Build structured result. Full output saved to disk, summary returned inline.
-    This is the key output-discipline mechanism.
-    """
-    output_file.write_text(
-        f"=== AGENT: {agent} | HOST: {host} ===\n"
-        f"=== PROMPT ===\n{prompt}\n\n"
-        f"=== OUTPUT ===\n{raw_output}\n",
-        encoding="utf-8",
-    )
-
-    preview, was_truncated = _orchestra_truncate(raw_output)
-    success = return_code == 0
-
-    result = {
-        "agent": agent,
-        "host": host,
-        "success": success,
-        "return_code": return_code,
-        "output_file": str(output_file),
-        "output_preview": preview,
-        "truncated": was_truncated,
-        "output_bytes": len(raw_output),
-    }
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-async def _orchestra_run_cli_raw(
-    host: str,
-    cli_command: str,
-    timeout: int,
-    cwd: str | None = None,
-) -> tuple[int, str, str]:
-    """Run a CLI command and return structured (rc, stdout, stderr).
-
-    Bypasses the text-formatting layer to give callers access to the actual
-    return code, avoiding regex re-parsing of formatted output.
-    """
-    config = _resolve_host(host)
-
-    if config.is_local:
-        shell_cmd = cli_command
-        if cwd:
-            shell_cmd = f"cd {shlex.quote(cwd)} && {cli_command}"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "bash", "-c", shell_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
-            )
-            return (
-                proc.returncode or 0,
-                stdout_b.decode(errors="replace"),
-                stderr_b.decode(errors="replace"),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return -1, "", f"timeout after {timeout}s"
-        except FileNotFoundError as e:
-            return -1, "", f"binary not found: {e}"
-    else:
-        full_cmd = _wrap_command(config, cli_command, cwd, sudo=False)
-        last_stderr = ""
-        for attempt in range(1, CONFIG.max_retries + 1):
-            await _ensure_connection(config.alias, host)
-            rc, stdout, stderr = await _async_run(
-                ["ssh", config.alias, full_cmd], timeout=timeout,
-            )
-            if not _is_transient_failure(rc, stderr):
-                if rc not in (-1, 255):
-                    await _update_host_status(host, HostStatus.CONNECTED)
-                elif stderr:
-                    await _update_host_status(host, HostStatus.ERROR, last_error=stderr.strip())
-                return rc, stdout, stderr
-            last_stderr = stderr.strip()
-            if attempt < CONFIG.max_retries:
-                backoff = CONFIG.retry_backoff_base * (2 ** (attempt - 1))
-                await asyncio.sleep(backoff)
-                await _teardown_connection(config.alias)
-        await _update_host_status(host, HostStatus.ERROR, last_error=last_stderr)
-        return -1, "", f"failed after {CONFIG.max_retries} attempts: {last_stderr}"
-
-
-async def _orchestra_run_cli(
-    host: str,
-    cli_command: str,
-    timeout: int,
-    cwd: str | None = None,
-) -> tuple[int, str]:
-    """Run a CLI command, returning (rc, formatted_output).
-
-    Delegates to _orchestra_run_cli_raw for structured execution,
-    then formats the output for inline display.
-    """
-    rc, stdout, stderr = await _orchestra_run_cli_raw(host, cli_command, timeout, cwd)
-    combined = _format_result(stdout, stderr, rc)
-    return rc, combined
-
-
-# ---------------------------------------------------------------------------
-# Auto-promote: adaptive inline → background execution
-# ---------------------------------------------------------------------------
-
-async def _auto_promote(
-    execute_fn: Callable[[], Awaitable[str]],
-    *,
-    block_timeout: int,
-    agent: str,
-    host: str,
-    prompt: str,
-) -> str:
-    """Run execute_fn with adaptive blocking.
-
-    Tries to return the result inline. If block_timeout elapses before the
-    work completes, promotes the task to the background registry and returns
-    a task_id immediately.
-
-    Semantics of block_timeout:
-      > 0  — wait this many seconds inline, then auto-promote
-      == 0 — dispatch immediately (never block)
-      < 0  — block forever (legacy behaviour, no promotion)
-
-    Uses asyncio.shield() so that when block_timeout fires, the inner task
-    keeps running — we stop waiting, but the subprocess doesn't stop.
-    """
-    task_id = secrets.token_hex(8)
-    started_at = datetime.now(timezone.utc)
-
-    # Start work immediately as an asyncio task
-    work_task = asyncio.create_task(execute_fn())
-
-    # --- Full-blocking mode (legacy) ---
-    if block_timeout < 0:
-        return await work_task
-
-    # --- Try inline execution within block_timeout ---
-    if block_timeout > 0:
-        try:
-            result = await asyncio.wait_for(
-                asyncio.shield(work_task),
-                timeout=block_timeout,
-            )
-            return result  # Finished inline — no registry overhead
-        except asyncio.TimeoutError:
-            pass  # Fall through to auto-promote
-
-    # --- Auto-promote: register as background task ---
-    ts = TaskState(
-        task_id=task_id,
-        agent=agent,
-        host=host,
-        prompt=prompt[:200],
-        status="running",
-        started_at=started_at,
-        asyncio_task=work_task,
-    )
-
-    async def _monitor() -> None:
-        try:
-            result = await work_task
-            ts.status = "done"
-            ts.result_json = result
-        except asyncio.CancelledError:
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": "cancelled", "task_id": task_id, "agent": agent,
-            })
-        except Exception as exc:
-            logger.exception(f"auto_promote [{task_id}] {agent} on {host} failed")
-            ts.status = "failed"
-            ts.result_json = json.dumps({
-                "error": str(exc), "task_id": task_id, "agent": agent,
-            })
-        finally:
-            ts.finished_at = datetime.now(timezone.utc)
-            ts._done_event.set()
-
-    asyncio.create_task(_monitor())
-
-    async with _REGISTRY_LOCK:
-        TASK_REGISTRY[task_id] = ts
-
-    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
-    logger.info(f"auto_promote: {agent} on {host} [{task_id}] promoted after {elapsed:.1f}s")
-    return json.dumps({
-        "auto_promoted": True,
-        "task_id": task_id,
-        "agent": agent,
-        "host": host,
-        "status": "running",
-        "elapsed_seconds": round(elapsed, 1),
-    })
-
 
 @mcp.tool()
 async def agent_status(host: str = "") -> str:
@@ -1332,10 +820,9 @@ async def codex_execute(
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
 
-    Codex runs unsandboxed (bypasses workspace-write sandbox that deadlocks
-    Rust/Tokio runtimes like LanceDB). It can read files, edit code, run
-    commands, and execute tests. Best for: feature implementation,
-    refactoring, bug fixes, test generation.
+    Codex runs unsandboxed. It can read files, edit code, run commands,
+    and execute tests. Best for: feature implementation, refactoring,
+    bug fixes, test generation.
 
     Full output is saved to disk; a structured summary is returned.
     Auto-promotes to background after block_timeout seconds.
@@ -1378,142 +865,55 @@ async def gemini_analyze(
     context_files: list[str] | None = None,
     working_dir: str = CONFIG.default_repo,
     model: str = "",
-    yolo: bool = False,
+    mode: str = "analyze",
     timeout: int = CONFIG.gemini_timeout,
     block_timeout: int = CONFIG.block_timeout_default,
 ) -> str:
-    """Dispatch an analysis task to Google Gemini CLI on a Maestro host.
+    """Dispatch a task to Google Gemini CLI on a Maestro host.
 
-    Gemini 3.1 Pro runs in headless mode (read-only by default) with high
-    thinking level (Deep Think Mini) enabled by default. Best for:
-    large-context codebase analysis, architectural review, document
-    comparison, pattern identification across many files.
+    Gemini 3.1 Pro with Deep Think Mini. Modes:
+      - "analyze" (default): read-only analysis, large-context review
+      - "execute": write mode (--yolo) for code generation / refactoring
+      - "research": web search grounding for research queries
 
     Full output is saved to disk; a structured summary is returned.
     Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
-        prompt: The analytical question or task.
+        prompt: The task or question.
         context_files: File paths to include via @file syntax (leverages 1M context).
         working_dir: Working directory for the invocation.
         model: Gemini model (empty=default).
-        yolo: Enable write mode (default False = read-only, safer).
+        mode: "analyze" (read-only), "execute" (write), or "research" (web search).
         timeout: Max seconds to wait (default 600).
         block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
     task_id = _orchestra_task_id(prompt)
-    output_file = _orchestra_output_path("gemini", task_id)
+    agent_label = "gemini_research" if mode == "research" else "gemini"
+    output_file = _orchestra_output_path(agent_label, task_id)
 
     async def _execute() -> str:
-        full_prompt = prompt
-        if context_files:
-            file_refs = " ".join(f"@{f}" for f in context_files)
-            full_prompt = f"{file_refs} {prompt}"
-        escaped_prompt = shlex.quote(full_prompt)
-        model_flag = f"--model {shlex.quote(model)} " if model else ""
-        yolo_flag = "--yolo " if yolo else ""
-        cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
-        logger.info(f"Orchestra: gemini_analyze on {host} [{task_id}]: {prompt[:80]}...")
-        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
-        return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
-
-    return await _auto_promote(
-        _execute,
-        block_timeout=block_timeout,
-        agent="gemini",
-        host=host,
-        prompt=prompt,
-    )
-
-
-@mcp.tool()
-async def gemini_research(
-    host: str,
-    query: str,
-    timeout: int = CONFIG.gemini_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
-) -> str:
-    """Dispatch a web research task to Gemini CLI with Google Search grounding.
-
-    Gemini 3.1 Pro defaults to high thinking level (Deep Think Mini).
-    Best for: jurisprudencia research, technical documentation lookup,
-    current events, regulatory changes.
-
-    Full output is saved to disk; a structured summary is returned.
-    Auto-promotes to background after block_timeout seconds.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        query: Research query (Gemini uses Google Search grounding).
-        timeout: Max seconds to wait (default 600).
-        block_timeout: Inline wait before auto-promote (default 20).
-    """
-    task_id = _orchestra_task_id(query)
-    output_file = _orchestra_output_path("gemini_research", task_id)
-
-    async def _execute() -> str:
-        research_prompt = (
-            f"Research the following topic thoroughly using web search. "
-            f"Provide a comprehensive answer with sources.\n\n{query}"
-        )
-        escaped = shlex.quote(research_prompt)
-        cli_cmd = f"gemini -p {escaped} --output-format json"
-        logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {query[:80]}...")
-        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
-        return _orchestra_build_result("gemini", host, query, _extract_gemini_response(raw_output), rc, output_file)
-
-    return await _auto_promote(
-        _execute,
-        block_timeout=block_timeout,
-        agent="gemini",
-        host=host,
-        prompt=query,
-    )
-
-
-@mcp.tool()
-async def gemini_execute(
-    host: str,
-    prompt: str,
-    context_files: list[str] | None = None,
-    working_dir: str = CONFIG.default_repo,
-    model: str = "",
-    timeout: int = CONFIG.gemini_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
-) -> str:
-    """Dispatch a coding task to Google Gemini CLI on a Maestro host.
-
-    Gemini 3.1 Pro runs in write mode (--yolo) with high thinking level
-    (Deep Think Mini) enabled by default. Best for: code generation,
-    refactoring, bug fixes, and implementation tasks that benefit from
-    Gemini's 1M-token context window across many files.
-
-    Full output is saved to disk; a structured summary is returned.
-    Auto-promotes to background after block_timeout seconds.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        prompt: The coding task. Be specific and scoped.
-        context_files: File paths to include via @file syntax (leverages 1M context).
-        working_dir: Git repo directory where Gemini works.
-        model: Gemini model (empty=default).
-        timeout: Max seconds to wait (default 600).
-        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
-    """
-    task_id = _orchestra_task_id(prompt)
-    output_file = _orchestra_output_path("gemini", task_id)
-
-    async def _execute() -> str:
-        full_prompt = prompt
-        if context_files:
-            file_refs = " ".join(f"@{f}" for f in context_files)
-            full_prompt = f"{file_refs} {prompt}"
-        escaped_prompt = shlex.quote(full_prompt)
-        model_flag = f"--model {shlex.quote(model)} " if model else ""
-        cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}--yolo"
-        logger.info(f"Orchestra: gemini_execute on {host} [{task_id}]: {prompt[:80]}...")
-        rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+        if mode == "research":
+            research_prompt = (
+                f"Research the following topic thoroughly using web search. "
+                f"Provide a comprehensive answer with sources.\n\n{prompt}"
+            )
+            escaped = shlex.quote(research_prompt)
+            cli_cmd = f"gemini -p {escaped} --output-format json"
+            logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {prompt[:80]}...")
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
+        else:
+            full_prompt = prompt
+            if context_files:
+                file_refs = " ".join(f"@{f}" for f in context_files)
+                full_prompt = f"{file_refs} {prompt}"
+            escaped_prompt = shlex.quote(full_prompt)
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            yolo_flag = "--yolo " if mode == "execute" else ""
+            cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
+            logger.info(f"Orchestra: gemini_{mode} on {host} [{task_id}]: {prompt[:80]}...")
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
         return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
     return await _auto_promote(
@@ -1570,16 +970,15 @@ async def claude_execute(
     host: str,
     prompt: str,
     working_dir: str = CONFIG.default_repo,
-    max_budget_usd: float = 1.0,
     allowed_tools: str = "Edit,Write,Bash(git:*),Read",
     timeout: int = CONFIG.claude_timeout,
     block_timeout: int = CONFIG.block_timeout_default,
 ) -> str:
     """Dispatch a coding task to Claude Code CLI on a Maestro host.
 
-    Claude Code runs in bypassPermissions mode with a dollar-budget cap.
-    Best for: multi-file refactoring, architectural changes, CLAUDE.md-aware
-    tasks, and anything requiring strong reasoning over large codebases.
+    Claude Code runs in bypassPermissions mode. Best for: multi-file
+    refactoring, architectural changes, CLAUDE.md-aware tasks, and
+    anything requiring strong reasoning over large codebases.
 
     Full output is saved to disk; a structured summary is returned.
     Auto-promotes to background after block_timeout seconds.
@@ -1588,7 +987,6 @@ async def claude_execute(
         host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
-        max_budget_usd: Dollar cap per invocation (default $1.00).
         allowed_tools: Comma-separated tool whitelist (default: Edit,Write,Bash(git:*),Read).
         timeout: Max seconds to wait (default 600).
         block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
@@ -1603,8 +1001,7 @@ async def claude_execute(
         cli_cmd = (
             f"claude -p {escaped_prompt} --output-format json "
             f"--permission-mode bypassPermissions "
-            f"--allowedTools {escaped_tools} "
-            f"--max-budget-usd {max_budget_usd}"
+            f"--allowedTools {escaped_tools}"
         )
         logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
         rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
@@ -1620,96 +1017,6 @@ async def claude_execute(
 
 
 @mcp.tool()
-async def codex_dispatch(
-    host: str,
-    prompt: str,
-    working_dir: str = CONFIG.default_repo,
-    model: str = "",
-    reasoning_effort: str = "xhigh",
-    timeout: int = CONFIG.codex_timeout,
-) -> str:
-    """Dispatch a coding task to Codex CLI asynchronously. Returns a task_id immediately.
-
-    Use agent_poll(task_id) to check progress and retrieve the result.
-    Best for long-running tasks where you don't want to block.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        prompt: The coding task. Be specific and scoped.
-        working_dir: Git repo directory where Codex works.
-        model: Codex model (empty=default, 'gpt-5.3-codex').
-        reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
-        timeout: Max seconds for the background task (default 300).
-    """
-    return await codex_execute(
-        host=host, prompt=prompt, working_dir=working_dir,
-        model=model, reasoning_effort=reasoning_effort,
-        timeout=timeout, block_timeout=0,
-    )
-
-
-@mcp.tool()
-async def gemini_dispatch(
-    host: str,
-    prompt: str,
-    context_files: list[str] | None = None,
-    working_dir: str = CONFIG.default_repo,
-    model: str = "",
-    yolo: bool = False,
-    timeout: int = CONFIG.gemini_timeout,
-) -> str:
-    """Dispatch an analysis task to Gemini CLI asynchronously. Returns a task_id immediately.
-
-    Gemini 3.1 Pro defaults to high thinking level (Deep Think Mini).
-    Use agent_poll(task_id) to check progress and retrieve the result.
-    Best for large-context analysis where you don't want to block.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        prompt: The analytical question or task.
-        context_files: File paths to include via @file syntax.
-        working_dir: Working directory for the invocation.
-        model: Gemini model (empty=default).
-        yolo: Enable write mode (default False = read-only).
-        timeout: Max seconds for the background task (default 180).
-    """
-    return await gemini_analyze(
-        host=host, prompt=prompt, context_files=context_files,
-        working_dir=working_dir, model=model, yolo=yolo,
-        timeout=timeout, block_timeout=0,
-    )
-
-
-@mcp.tool()
-async def claude_dispatch(
-    host: str,
-    prompt: str,
-    working_dir: str = CONFIG.default_repo,
-    max_budget_usd: float = 1.0,
-    allowed_tools: str = "Edit,Write,Bash(git:*),Read",
-    timeout: int = CONFIG.claude_timeout,
-) -> str:
-    """Dispatch a coding task to Claude Code CLI asynchronously. Returns a task_id immediately.
-
-    Use agent_poll(task_id) to check progress and retrieve the result.
-    Best for multi-file refactoring or architectural tasks that take minutes.
-
-    Args:
-        host: Target host (see maestro_status for available hosts)
-        prompt: The coding task. Be specific and scoped.
-        working_dir: Git repo directory where Claude Code works.
-        max_budget_usd: Dollar cap per invocation (default $1.00).
-        allowed_tools: Comma-separated tool whitelist.
-        timeout: Max seconds for the background task (default 300).
-    """
-    return await claude_execute(
-        host=host, prompt=prompt, working_dir=working_dir,
-        max_budget_usd=max_budget_usd, allowed_tools=allowed_tools,
-        timeout=timeout, block_timeout=0,
-    )
-
-
-@mcp.tool()
 async def agent_poll(task_id: str, wait: int = 0) -> str:
     """Check the status of an async agent dispatch task.
 
@@ -1717,7 +1024,7 @@ async def agent_poll(task_id: str, wait: int = 0) -> str:
     or the full structured result if the task has completed.
 
     Args:
-        task_id: Task ID returned by a previous *_dispatch call.
+        task_id: Task ID returned by a previous dispatch call.
         wait: Max seconds to hold connection waiting for completion (long-poll).
               0 = return immediately (default). >0 = wait up to this many seconds.
     """
@@ -1726,12 +1033,11 @@ async def agent_poll(task_id: str, wait: int = 0) -> str:
     if ts is None:
         return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
 
-    # Long-poll: hold connection until task completes or wait expires
     if ts.status == "running" and wait > 0:
         try:
             await asyncio.wait_for(ts._done_event.wait(), timeout=wait)
         except asyncio.TimeoutError:
-            pass  # Still running — return current status below
+            pass
 
     if ts.status == "running":
         elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
@@ -1774,32 +1080,24 @@ if __name__ == "__main__":
     if args.transport == "streamable-http":
         import uvicorn
 
-        # FastMCP's streamable_http_app() includes all OAuth routes,
-        # metadata endpoints, and bearer auth middleware automatically.
         app = mcp.streamable_http_app()
 
-        # OAuth URL rewrite: LAN/localhost clients get metadata matching
-        # their connection URL instead of the public MAESTRO_ISSUER_URL.
         from oauth_rewrite import OAuthURLRewriteMiddleware, _parse_lan_origins
         from urllib.parse import urlparse as _urlparse
 
-        # Build allowed origins allowlist
         _parsed_issuer = _urlparse(CONFIG.issuer_url)
-        _canonical_host = _parsed_issuer.netloc  # e.g. "maestro.rmstxrx.dev"
+        _canonical_host = _parsed_issuer.netloc
         _allowed_origins: dict[str, str] = {
             _canonical_host: CONFIG.issuer_url,
-            # Always allow localhost/loopback
             "localhost:8222": "http://localhost:8222",
             "127.0.0.1:8222": "http://127.0.0.1:8222",
         }
-        # Add LAN origins from env var
         _lan_env = os.environ.get("MAESTRO_LAN_ORIGINS", "")
         _allowed_origins.update(_parse_lan_origins(_lan_env))
         logger.info("oauth_rewrite allowed_origins: %s", list(_allowed_origins.keys()))
 
         app = OAuthURLRewriteMiddleware(app, CONFIG.issuer_url, allowed_origins=_allowed_origins)
 
-        # ASGI middleware: request logging + registration rate-limit enforcement
         from starlette.types import ASGIApp as _ASGIApp, Receive as _Recv, Scope as _Scp, Send as _Snd
 
         class _MaestroMiddleware:
@@ -1829,17 +1127,15 @@ if __name__ == "__main__":
         server = uvicorn.Server(config)
 
         async def _serve_with_maestro_lifecycle() -> None:
-            global _EVICTION_TASK
             logger.info("maestro: warming up connections...")
             results = await warmup_all_hosts()
             connected = sum(1 for v in results.values() if v)
             logger.info(f"maestro: {connected}/{len(results)} hosts connected")
-            _EVICTION_TASK = asyncio.create_task(_periodic_eviction())
+            eviction_task = start_eviction_loop()
             try:
                 await server.serve()
             finally:
-                if _EVICTION_TASK:
-                    _EVICTION_TASK.cancel()
+                cancel_eviction_loop()
                 try:
                     logger.info("maestro: shutting down, closing connections...")
                     await teardown_all_hosts()
