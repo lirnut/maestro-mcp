@@ -46,6 +46,7 @@ class TaskState:
     asyncio_task: asyncio.Task | None = None
     output_file: Path | None = None
     result_json: str | None = None
+    last_polled_at: float = 0.0
     _done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 

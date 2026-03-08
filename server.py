@@ -18,13 +18,11 @@ import os
 import shlex
 import time
 import yaml
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
@@ -73,6 +71,7 @@ from maestro.tools.orchestra import (
     configure_orchestra,
     start_eviction_loop,
 )
+from maestro.client import get_client_context, set_client_context
 from maestro.relay import configure_relay, transfer_push, transfer_pull
 from maestro_oauth import MaestroOAuthProvider
 
@@ -338,24 +337,23 @@ async def _transfer_pull(request: Request) -> Response:
 @mcp.tool()
 async def maestro_exec(
     host: str, command: str, cwd: str | None = None,
-    sudo: bool = False, timeout: int = CONFIG.ssh_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
+    sudo: bool = False,
 ) -> str:
     """Execute a shell command on a remote host.
 
-    If the command takes longer than block_timeout seconds, it auto-promotes
-    to a background task and returns a task_id. Use agent_poll(task_id) to
-    retrieve the result.
+    Auto-promotes to background if the command takes too long.
+    Use agent_poll(task_id) to retrieve the result.
 
     Args:
         host: Target host (see maestro_status for available hosts)
         command: Shell command to execute
         cwd: Working directory to cd into before running the command
         sudo: If True, prepend sudo (assumes passwordless sudo on target)
-        timeout: Max seconds to wait (default from SSH_TIMEOUT env, usually 300)
-        block_timeout: Max seconds to block inline before auto-promoting (default 20).
-                       Use -1 to force full blocking (legacy).
     """
+    ctx = get_client_context()
+    timeout = CONFIG.ssh_timeout
+    block_timeout = ctx.profile["block_timeout_exec"]
+
     async def _execute() -> str:
         config = _resolve_host(host)
         if config.is_local:
@@ -380,25 +378,23 @@ async def maestro_exec(
 @mcp.tool()
 async def maestro_script(
     host: str, script: str, cwd: str | None = None,
-    sudo: bool = False, timeout: int = CONFIG.ssh_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
+    sudo: bool = False,
 ) -> str:
     """Execute a multi-line script on a remote host via stdin.
 
     The script is piped to bash (or powershell on Windows hosts) via `bash -s`.
-    Use this instead of chaining commands with &&.
-
-    If the script takes longer than block_timeout seconds, it auto-promotes
-    to a background task and returns a task_id.
+    Auto-promotes to background if the script takes too long.
 
     Args:
         host: Target host (see maestro_status for available hosts)
         script: Multi-line script body (no shebang needed)
         cwd: Working directory — a `cd` is prepended to the script
         sudo: If True, run the whole script under sudo
-        timeout: Max seconds to wait
-        block_timeout: Max seconds to block inline before auto-promoting (default 20).
     """
+    ctx = get_client_context()
+    timeout = CONFIG.ssh_timeout
+    block_timeout = ctx.profile["block_timeout_exec"]
+
     async def _execute() -> str:
         config = _resolve_host(host)
         if config.is_local:
@@ -432,7 +428,7 @@ async def maestro_script(
 @mcp.tool()
 async def maestro_read(
     host: str, path: str, head: int | None = None,
-    tail: int | None = None, timeout: int = CONFIG.ssh_timeout,
+    tail: int | None = None,
 ) -> str:
     """Read a text file from a remote host.
 
@@ -443,7 +439,6 @@ async def maestro_read(
         path: Absolute path to the file on the remote host
         head: If set, return only the first N lines
         tail: If set, return only the last N lines
-        timeout: Max seconds to wait
     """
     config = _resolve_host(host)
     if config.is_local:
@@ -462,13 +457,13 @@ async def maestro_read(
             cmd = f"tail -n {tail} {shlex.quote(path)}"
         else:
             cmd = f"cat {shlex.quote(path)}"
-    return await _ssh_run(host, [cmd], timeout=timeout)
+    return await _ssh_run(host, [cmd], timeout=CONFIG.ssh_timeout)
 
 
 @mcp.tool()
 async def maestro_write(
     host: str, path: str, content: str, append: bool = False,
-    sudo: bool = False, timeout: int = CONFIG.ssh_timeout,
+    sudo: bool = False,
 ) -> str:
     """Write text content to a file on a remote host.
 
@@ -481,9 +476,9 @@ async def maestro_write(
         content: Text content to write
         append: If True, append instead of overwrite
         sudo: If True, write with sudo privileges
-        timeout: Max seconds to wait
     """
     config = _resolve_host(host)
+    timeout = CONFIG.ssh_timeout
     if config.is_local:
         return _local_write_file(path, content, append=append, sudo=sudo)
     if config.shell == HostShell.POWERSHELL:
@@ -615,8 +610,6 @@ async def codex_execute(
     working_dir: str = CONFIG.default_repo,
     model: str = "",
     reasoning_effort: str = "xhigh",
-    timeout: int = CONFIG.codex_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
 ) -> str:
     """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
 
@@ -625,7 +618,6 @@ async def codex_execute(
     bug fixes, test generation.
 
     Full output is saved to disk; a structured summary is returned.
-    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -633,9 +625,10 @@ async def codex_execute(
         working_dir: Git repo directory where Codex works.
         model: Codex model (empty=default, 'gpt-5.3-codex').
         reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
-        timeout: Max seconds to wait (default 600).
-        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
+    ctx = get_client_context()
+    timeout = CONFIG.codex_timeout
+    block_timeout = ctx.profile["block_timeout_agent"]
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("codex", task_id)
 
@@ -666,8 +659,6 @@ async def gemini_analyze(
     working_dir: str = CONFIG.default_repo,
     model: str = "",
     mode: str = "analyze",
-    timeout: int = CONFIG.gemini_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
 ) -> str:
     """Dispatch a task to Google Gemini CLI on a Maestro host.
 
@@ -677,7 +668,6 @@ async def gemini_analyze(
       - "research": web search grounding for research queries
 
     Full output is saved to disk; a structured summary is returned.
-    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
@@ -686,9 +676,10 @@ async def gemini_analyze(
         working_dir: Working directory for the invocation.
         model: Gemini model (empty=default).
         mode: "analyze" (read-only), "execute" (write), or "research" (web search).
-        timeout: Max seconds to wait (default 600).
-        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
+    ctx = get_client_context()
+    timeout = CONFIG.gemini_timeout
+    block_timeout = ctx.profile["block_timeout_agent"]
     task_id = _orchestra_task_id(prompt)
     agent_label = "gemini_research" if mode == "research" else "gemini"
     output_file = _orchestra_output_path(agent_label, task_id)
@@ -771,8 +762,6 @@ async def claude_execute(
     prompt: str,
     working_dir: str = CONFIG.default_repo,
     allowed_tools: str = "Edit,Write,Bash(git:*),Read",
-    timeout: int = CONFIG.claude_timeout,
-    block_timeout: int = CONFIG.block_timeout_default,
 ) -> str:
     """Dispatch a coding task to Claude Code CLI on a Maestro host.
 
@@ -781,16 +770,16 @@ async def claude_execute(
     anything requiring strong reasoning over large codebases.
 
     Full output is saved to disk; a structured summary is returned.
-    Auto-promotes to background after block_timeout seconds.
 
     Args:
         host: Target host (see maestro_status for available hosts)
         prompt: The coding task. Be specific and scoped.
         working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
         allowed_tools: Comma-separated tool whitelist (default: Edit,Write,Bash(git:*),Read).
-        timeout: Max seconds to wait (default 600).
-        block_timeout: Inline wait before auto-promote (default 20). 0=dispatch immediately.
     """
+    ctx = get_client_context()
+    timeout = CONFIG.claude_timeout
+    block_timeout = ctx.profile["block_timeout_agent"]
     task_id = _orchestra_task_id(prompt)
     output_file = _orchestra_output_path("claude", task_id)
 
@@ -817,38 +806,46 @@ async def claude_execute(
 
 
 @mcp.tool()
-async def agent_poll(task_id: str, wait: int = 0) -> str:
+async def agent_poll(task_id: str) -> str:
     """Check the status of an async agent dispatch task.
 
-    Returns immediately with either the running status + elapsed time,
-    or the full structured result if the task has completed.
+    Returns the running status + elapsed time, or the full structured
+    result if the task has completed. Subject to per-client poll cooldown.
 
     Args:
         task_id: Task ID returned by a previous dispatch call.
-        wait: Max seconds to hold connection waiting for completion (long-poll).
-              0 = return immediately (default). >0 = wait up to this many seconds.
     """
     async with _REGISTRY_LOCK:
         ts = TASK_REGISTRY.get(task_id)
     if ts is None:
         return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
 
-    if ts.status == "running" and wait > 0:
-        try:
-            await asyncio.wait_for(ts._done_event.wait(), timeout=wait)
-        except asyncio.TimeoutError:
-            pass
+    # Bypass cooldown for completed tasks
+    if ts.status != "running":
+        return ts.result_json
 
-    if ts.status == "running":
-        elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+    # Poll cooldown enforcement
+    ctx = get_client_context()
+    cooldown = ctx.profile["poll_cooldown"]
+    now = time.time()
+    since_last = now - ts.last_polled_at
+    if ts.last_polled_at > 0 and since_last < cooldown:
+        retry_after = round(cooldown - since_last, 1)
         return json.dumps({
+            "status": "cooldown",
             "task_id": task_id,
-            "agent": ts.agent,
-            "host": ts.host,
-            "status": "running",
-            "elapsed_seconds": round(elapsed, 1),
+            "retry_after": retry_after,
         })
-    return ts.result_json
+    ts.last_polled_at = now
+
+    elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
+    return json.dumps({
+        "task_id": task_id,
+        "agent": ts.agent,
+        "host": ts.host,
+        "status": "running",
+        "elapsed_seconds": round(elapsed, 1),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +914,11 @@ if __name__ == "__main__":
                 logger.info("recv: %s %s auth=%s ua=%s", method, path,
                             auth[:40] + "..." if len(auth) > 40 else (auth or "none"),
                             ua[:60])
+
+                # Set client context for this request
+                request = Request(scope, receive, send)
+                set_client_context(request)
+
                 await self.inner(scope, receive, send)
 
         app = _MaestroMiddleware(app)
