@@ -23,8 +23,9 @@ AGENT_SCOPE_PREFIX = (
     "1. ONLY modify files and code directly related to the task below.\n"
     "2. Do NOT refactor, clean up, or improve code outside the task scope.\n"
     "3. Do NOT run tests unless explicitly asked.\n"
-    "4. Do NOT write or update documentation unless explicitly asked.\n"
-    "5. When done, output ONLY: files changed + one-sentence summary per file.\n"
+    "4. Do NOT update existing documentation unless explicitly asked.\n"
+    "5. When done, write a brief debrief to docs/journal/debriefs/YYYY-MM-DD-{task-slug}.md "
+    "with: task summary, files changed (1 sentence each), any surprises or decisions made.\n"
     "6. If the task is ambiguous, do the MINIMUM viable interpretation.\n\n"
     "TASK:\n"
 )
