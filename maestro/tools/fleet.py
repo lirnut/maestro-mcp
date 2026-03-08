@@ -52,14 +52,7 @@ from maestro.transport import (
 
 logger = logging.getLogger("maestro")
 
-# Late-bound — set by register_tools()
 _CONFIG: MaestroConfig | None = None
-
-
-def _cfg() -> MaestroConfig:
-    if _CONFIG is None:
-        raise RuntimeError("fleet tools not configured")
-    return _CONFIG
 
 
 def register_tools(mcp: object, config: MaestroConfig) -> None:
@@ -67,27 +60,14 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     global _CONFIG
     _CONFIG = config
 
-    # We access mcp.tool() decorator below — import type here to avoid
-    # circular imports at module level.
     from mcp.server.fastmcp import FastMCP
     assert isinstance(mcp, FastMCP)
 
+    # --- Fleet tools ---
+
     @mcp.tool()
-    async def maestro_exec(
-        host: str, command: str, cwd: str | None = None,
-        sudo: bool = False,
-    ) -> str:
-        """Execute a shell command on a remote host.
-
-        Auto-promotes to background if the command takes too long.
-        Use agent_poll(task_id) to retrieve the result.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            command: Shell command to execute
-            cwd: Working directory to cd into before running the command
-            sudo: If True, prepend sudo (assumes passwordless sudo on target)
-        """
+    async def exec(host: str, command: str, cwd: str | None = None, sudo: bool = False) -> str:
+        """Run a command on a host."""
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -99,35 +79,17 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 if sudo:
                     parts.append("sudo")
                 parts.append(command)
-                full_cmd = " ".join(parts)
-                return await _local_run(full_cmd, timeout=timeout, cwd=cwd)
-            full_cmd = _wrap_command(cfg, command, cwd, sudo)
-            return await _ssh_run(host, [full_cmd], timeout=timeout)
+                return await _local_run(" ".join(parts), timeout=timeout, cwd=cwd)
+            return await _ssh_run(host, [_wrap_command(cfg, command, cwd, sudo)], timeout=timeout)
 
         return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="exec",
-            host=host,
-            prompt=command[:200],
+            _execute, block_timeout=block_timeout,
+            agent="exec", host=host, prompt=command[:200],
         )
 
     @mcp.tool()
-    async def maestro_script(
-        host: str, script: str, cwd: str | None = None,
-        sudo: bool = False,
-    ) -> str:
-        """Execute a multi-line script on a remote host via stdin.
-
-        The script is piped to bash (or powershell on Windows hosts) via `bash -s`.
-        Auto-promotes to background if the script takes too long.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            script: Multi-line script body (no shebang needed)
-            cwd: Working directory — a `cd` is prepended to the script
-            sudo: If True, run the whole script under sudo
-        """
+    async def script(host: str, script: str, cwd: str | None = None, sudo: bool = False) -> str:
+        """Run a multi-line script on a host."""
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -154,28 +116,13 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             return await _ssh_run(host, interpreter, timeout=timeout, stdin_data=stdin_body)
 
         return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="script",
-            host=host,
-            prompt=script[:200],
+            _execute, block_timeout=block_timeout,
+            agent="script", host=host, prompt=script[:200],
         )
 
     @mcp.tool()
-    async def maestro_read(
-        host: str, path: str, head: int | None = None,
-        tail: int | None = None,
-    ) -> str:
-        """Read a text file from a remote host.
-
-        Returns the file contents. For large files, use head/tail to slice.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            path: Absolute path to the file on the remote host
-            head: If set, return only the first N lines
-            tail: If set, return only the last N lines
-        """
+    async def read(host: str, path: str, head: int | None = None, tail: int | None = None) -> str:
+        """Read a file from a host."""
         cfg = _resolve_host(host)
         if cfg.is_local:
             return _local_read_file(path, head=head, tail=tail)
@@ -196,22 +143,8 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         return await _ssh_run(host, [cmd], timeout=config.ssh_timeout)
 
     @mcp.tool()
-    async def maestro_write(
-        host: str, path: str, content: str, append: bool = False,
-        sudo: bool = False,
-    ) -> str:
-        """Write text content to a file on a remote host.
-
-        Pipes content via stdin to tee (or Out-File on PowerShell).
-        Creates parent directories automatically.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            path: Absolute path to the file on the remote host
-            content: Text content to write
-            append: If True, append instead of overwrite
-            sudo: If True, write with sudo privileges
-        """
+    async def write(host: str, path: str, content: str, append: bool = False, sudo: bool = False) -> str:
+        """Write content to a file on a host."""
         cfg = _resolve_host(host)
         timeout = config.ssh_timeout
         if cfg.is_local:
@@ -235,84 +168,57 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             return await _ssh_run(host, [cmd], timeout=timeout, stdin_data=content)
 
     @mcp.tool()
-    async def maestro_upload(host: str, local_path: str, remote_path: str) -> str:
-        """Upload a file to a remote host via SCP.
-
-        Use for binary files or large transfers. For text files, prefer maestro_write.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            local_path: Local file path to upload
-            remote_path: Destination path on remote host
-        """
+    async def transfer(host: str, direction: str, local_path: str, remote_path: str) -> str:
+        """Transfer a file to/from a host via SCP. direction: "upload" or "download"."""
         cfg = _resolve_host(host)
-        if cfg.is_local:
-            return _local_copy(local_path, remote_path, upload=True)
-        return await _scp_run(host, local_path, remote_path, upload=True)
+        if direction == "upload":
+            if cfg.is_local:
+                return _local_copy(local_path, remote_path, upload=True)
+            return await _scp_run(host, local_path, remote_path, upload=True)
+        elif direction == "download":
+            if cfg.is_local:
+                return _local_copy(remote_path, local_path, upload=False)
+            return await _scp_run(host, remote_path, local_path, upload=False)
+        else:
+            return json.dumps({"error": f"Invalid direction '{direction}'. Use 'upload' or 'download'."})
 
     @mcp.tool()
-    async def maestro_download(host: str, remote_path: str, local_path: str) -> str:
-        """Download a file from a remote host via SCP.
+    async def status() -> str:
+        """Check connectivity of all hosts. Returns structured JSON."""
 
-        Use for binary files or large transfers. For text files, prefer maestro_read.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            remote_path: File path on remote host
-            local_path: Local destination path
-        """
-        cfg = _resolve_host(host)
-        if cfg.is_local:
-            return _local_copy(remote_path, local_path, upload=False)
-        return await _scp_run(host, remote_path, local_path, upload=False)
-
-    @mcp.tool()
-    async def maestro_status() -> str:
-        """Check connectivity status of all SSH hosts.
-
-        Tests each host's ControlMaster socket and re-warms connections
-        that have gone stale. Returns a status summary.
-        """
-        lines = ["Maestro Status", "=" * 55]
-
-        async def _check_one(name: str, cfg: HostConfig) -> str:
+        async def _check_one(name: str, cfg: HostConfig) -> dict:
             if cfg.is_local:
                 await _update_host_status(name, HostStatus.CONNECTED)
-                return f"  {name:12s} [{'local':10s}]  ✓ LOCAL"
+                return {"status": "connected", "local": True}
             alive = await _check_control_master(cfg.alias)
             if alive:
                 await _update_host_status(name, HostStatus.CONNECTED)
-                status_str = "✓ CONNECTED"
-            else:
-                if await _warmup_connection(cfg.alias):
-                    await _update_host_status(name, HostStatus.CONNECTED)
-                    status_str = "↻ RECONNECTED"
-                else:
-                    await _update_host_status(name, HostStatus.DISCONNECTED)
-                    status_str = "✗ OFFLINE"
-            line = f"  {name:12s} [{cfg.shell.value:10s}]  {status_str}"
-            if cfg.last_error and cfg.status != HostStatus.CONNECTED:
-                line += f"  -- {cfg.last_error}"
-            return line
+                return {"status": "connected", "local": False}
+            if await _warmup_connection(cfg.alias):
+                await _update_host_status(name, HostStatus.CONNECTED)
+                return {"status": "reconnected", "local": False}
+            await _update_host_status(name, HostStatus.DISCONNECTED)
+            result: dict = {"status": "offline", "local": False}
+            if cfg.last_error:
+                result["error"] = cfg.last_error
+            return result
 
         results = await asyncio.gather(
             *[_check_one(name, cfg) for name, cfg in HOSTS.items()]
         )
-        lines.extend(results)
-        connected = sum(1 for c in HOSTS.values() if c.status == HostStatus.CONNECTED)
-        lines.append("=" * 55)
-        lines.append(f"{connected}/{len(HOSTS)} hosts available")
-        return "\n".join(lines)
+        hosts_status = dict(zip(HOSTS.keys(), results))
+        connected = sum(1 for r in results if r["status"] in ("connected", "reconnected"))
+        return json.dumps({
+            "hosts": hosts_status,
+            "available": connected,
+            "total": len(HOSTS),
+        })
 
     # --- Orchestra tools ---
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
-        """Check availability of Codex CLI and Gemini CLI on a Maestro host.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-        """
+        """Check Codex/Gemini CLI availability on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
 
@@ -331,28 +237,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         }, indent=2)
 
     @mcp.tool()
-    async def codex_execute(
-        host: str,
-        prompt: str,
-        working_dir: str = config.default_repo,
-        model: str = "",
-        reasoning_effort: str = "xhigh",
+    async def codex(
+        host: str, prompt: str, working_dir: str = config.default_repo,
+        model: str = "", reasoning_effort: str = "xhigh",
     ) -> str:
-        """Dispatch a coding task to OpenAI Codex CLI on a Maestro host.
-
-        Codex runs unsandboxed. It can read files, edit code, run commands,
-        and execute tests. Best for: feature implementation, refactoring,
-        bug fixes, test generation.
-
-        Full output is saved to disk; a structured summary is returned.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            prompt: The coding task. Be specific and scoped.
-            working_dir: Git repo directory where Codex works.
-            model: Codex model (empty=default, 'gpt-5.3-codex').
-            reasoning_effort: Thinking effort level ('low', 'medium', 'high', 'xhigh'). Default 'xhigh'.
-        """
+        """Dispatch task to Codex CLI. Returns task_id."""
         ctx = get_client_context()
         timeout = config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -365,44 +254,21 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
             cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
-            logger.info(f"Orchestra: codex_execute on {host} [{task_id}]: {prompt[:80]}...")
+            logger.info(f"Orchestra: codex on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("codex", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="codex",
-            host=host,
-            prompt=prompt,
+            _execute, block_timeout=block_timeout,
+            agent="codex", host=host, prompt=prompt,
         )
 
     @mcp.tool()
-    async def gemini_analyze(
-        host: str,
-        prompt: str,
-        context_files: list[str] | None = None,
-        working_dir: str = config.default_repo,
-        model: str = "",
-        mode: str = "analyze",
+    async def gemini(
+        host: str, prompt: str, context_files: list[str] | None = None,
+        working_dir: str = config.default_repo, model: str = "", mode: str = "analyze",
     ) -> str:
-        """Dispatch a task to Google Gemini CLI on a Maestro host.
-
-        Gemini 3.1 Pro with Deep Think Mini. Modes:
-          - "analyze" (default): read-only analysis, large-context review
-          - "execute": write mode (--yolo) for code generation / refactoring
-          - "research": web search grounding for research queries
-
-        Full output is saved to disk; a structured summary is returned.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            prompt: The task or question.
-            context_files: File paths to include via @file syntax (leverages 1M context).
-            working_dir: Working directory for the invocation.
-            model: Gemini model (empty=default).
-            mode: "analyze" (read-only), "execute" (write), or "research" (web search).
-        """
+        """Dispatch task to Gemini CLI. mode: "analyze", "execute", or "research"."""
         ctx = get_client_context()
         timeout = config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -416,8 +282,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                     f"Research the following topic thoroughly using web search. "
                     f"Provide a comprehensive answer with sources.\n\n{prompt}"
                 )
-                escaped = shlex.quote(research_prompt)
-                cli_cmd = f"gemini -p {escaped} --output-format json"
+                cli_cmd = f"gemini -p {shlex.quote(research_prompt)} --output-format json"
                 logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {prompt[:80]}...")
                 rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
             else:
@@ -425,82 +290,43 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 if context_files:
                     file_refs = " ".join(f"@{f}" for f in context_files)
                     full_prompt = f"{file_refs} {prompt}"
-                escaped_prompt = shlex.quote(full_prompt)
                 model_flag = f"--model {shlex.quote(model)} " if model else ""
                 yolo_flag = "--yolo " if mode == "execute" else ""
-                cli_cmd = f"gemini -p {escaped_prompt} --output-format json {model_flag}{yolo_flag}"
+                cli_cmd = f"gemini -p {shlex.quote(full_prompt)} --output-format json {model_flag}{yolo_flag}"
                 logger.info(f"Orchestra: gemini_{mode} on {host} [{task_id}]: {prompt[:80]}...")
                 rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
         return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="gemini",
-            host=host,
-            prompt=prompt,
+            _execute, block_timeout=block_timeout,
+            agent="gemini", host=host, prompt=prompt,
         )
 
     @mcp.tool()
-    async def agent_read_output(
-        file_path: str,
-        start_line: int = 0,
-        max_lines: int = 200,
-    ) -> str:
-        """Read full or partial output from a previous agent invocation.
-
-        When a codex_execute or gemini_analyze result was truncated,
-        use this to read the full output selectively with pagination.
-
-        Args:
-            file_path: Absolute path to output file (from previous tool results).
-            start_line: Start reading from this line (0-indexed).
-            max_lines: Maximum lines to return (1-1000).
-        """
+    async def read_output(file_path: str, start_line: int = 0, max_lines: int = 200) -> str:
+        """Read full or partial output from a previous agent run."""
         fp = Path(file_path)
-
         try:
             fp.resolve().relative_to(config.orchestra_output_dir.resolve())
         except ValueError:
             return json.dumps({"error": f"Access denied: only files in {config.orchestra_output_dir}"})
-
         if not fp.exists():
             return json.dumps({"error": f"File not found: {file_path}"})
-
         lines = fp.read_text(encoding="utf-8").splitlines()
         total = len(lines)
         selected = lines[start_line : start_line + max_lines]
-
         return json.dumps({
-            "file": str(fp),
-            "total_lines": total,
-            "start_line": start_line,
-            "lines_returned": len(selected),
-            "has_more": start_line + max_lines < total,
+            "file": str(fp), "total_lines": total, "start_line": start_line,
+            "lines_returned": len(selected), "has_more": start_line + max_lines < total,
             "content": "\n".join(selected),
         }, indent=2, ensure_ascii=False)
 
     @mcp.tool()
-    async def claude_execute(
-        host: str,
-        prompt: str,
-        working_dir: str = config.default_repo,
+    async def claude(
+        host: str, prompt: str, working_dir: str = config.default_repo,
         allowed_tools: str = "Edit,Write,Bash(git:*),Read",
     ) -> str:
-        """Dispatch a coding task to Claude Code CLI on a Maestro host.
-
-        Claude Code runs in bypassPermissions mode. Best for: multi-file
-        refactoring, architectural changes, CLAUDE.md-aware tasks, and
-        anything requiring strong reasoning over large codebases.
-
-        Full output is saved to disk; a structured summary is returned.
-
-        Args:
-            host: Target host (see maestro_status for available hosts)
-            prompt: The coding task. Be specific and scoped.
-            working_dir: Git repo directory where Claude Code works (reads CLAUDE.md here).
-            allowed_tools: Comma-separated tool whitelist (default: Edit,Write,Bash(git:*),Read).
-        """
+        """Dispatch task to Claude Code CLI. Returns task_id."""
         ctx = get_client_context()
         timeout = config.claude_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -516,33 +342,22 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools}"
             )
-            logger.info(f"Orchestra: claude_execute on {host} [{task_id}]: {prompt[:80]}...")
+            logger.info(f"Orchestra: claude on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("claude", host, prompt, raw_output, rc, output_file)
 
         return await _auto_promote(
-            _execute,
-            block_timeout=block_timeout,
-            agent="claude",
-            host=host,
-            prompt=prompt,
+            _execute, block_timeout=block_timeout,
+            agent="claude", host=host, prompt=prompt,
         )
 
     @mcp.tool()
-    async def agent_poll(task_id: str) -> str:
-        """Check the status of an async agent dispatch task.
-
-        Returns the running status + elapsed time, or the full structured
-        result if the task has completed. Subject to per-client poll cooldown.
-
-        Args:
-            task_id: Task ID returned by a previous dispatch call.
-        """
+    async def poll(task_id: str) -> str:
+        """Check task status or retrieve result."""
         async with _REGISTRY_LOCK:
             ts = TASK_REGISTRY.get(task_id)
         if ts is None:
-            return json.dumps({"error": f"Task '{task_id}' not found (completed and evicted, or never existed)"})
-
+            return json.dumps({"error": f"Task '{task_id}' not found"})
         if ts.status != "running":
             return ts.result_json
 
@@ -551,19 +366,14 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         now = time.time()
         since_last = now - ts.last_polled_at
         if ts.last_polled_at > 0 and since_last < cooldown:
-            retry_after = round(cooldown - since_last, 1)
             return json.dumps({
-                "status": "cooldown",
-                "task_id": task_id,
-                "retry_after": retry_after,
+                "status": "cooldown", "task_id": task_id,
+                "retry_after": round(cooldown - since_last, 1),
             })
         ts.last_polled_at = now
 
         elapsed = (datetime.now(timezone.utc) - ts.started_at).total_seconds()
         return json.dumps({
-            "task_id": task_id,
-            "agent": ts.agent,
-            "host": ts.host,
-            "status": "running",
-            "elapsed_seconds": round(elapsed, 1),
+            "task_id": task_id, "agent": ts.agent, "host": ts.host,
+            "status": "running", "elapsed_seconds": round(elapsed, 1),
         })

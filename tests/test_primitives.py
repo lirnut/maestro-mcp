@@ -1,24 +1,48 @@
-"""Tests for pure functions in server.py."""
+"""Tests for pure functions across maestro modules."""
 import sys
 from pathlib import Path
 
 import pytest
 
-# Add project root to path so we can import server
+# Add project root to path so we can import modules
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from server import (
+from maestro.hosts import (
     HostConfig,
     HostShell,
     HostStatus,
+    HOSTS,
     _format_result,
-    _is_transient_failure,
-    _orchestra_truncate,
     _ps_quote,
     _resolve_host,
     _wrap_command,
-    HOSTS,
-    MAX_INLINE_OUTPUT,
+    init_hosts,
+)
+from maestro.transport import _is_transient_failure
+from maestro.tools.orchestra import _orchestra_truncate, configure_orchestra
+from maestro.config import MaestroConfig
+
+_config = MaestroConfig.from_env()
+MAX_INLINE_OUTPUT = _config.max_inline_output
+
+# Initialize hosts (noop if hosts.yaml missing) and configure orchestra for truncate tests
+try:
+    init_hosts()
+except FileNotFoundError:
+    pass
+
+# Minimal configure so _orchestra_truncate works without full wiring
+configure_orchestra(
+    config=_config,
+    resolve_host=_resolve_host,
+    wrap_command=_wrap_command,
+    format_result=_format_result,
+    update_host_status=lambda *a, **kw: None,  # type: ignore[arg-type]
+    host_status=HostStatus,
+    ensure_connection=lambda *a, **kw: None,  # type: ignore[arg-type]
+    teardown_connection=lambda *a, **kw: None,  # type: ignore[arg-type]
+    async_run=lambda *a, **kw: None,  # type: ignore[arg-type]
+    is_transient_failure=_is_transient_failure,
 )
 
 
@@ -55,6 +79,7 @@ class TestPsQuote:
 # ---------------------------------------------------------------------------
 
 class TestResolveHost:
+    @pytest.mark.skipif(not HOSTS, reason="hosts.yaml not present")
     def test_known_host(self):
         # Use the first host from the loaded config
         name = next(iter(HOSTS))
