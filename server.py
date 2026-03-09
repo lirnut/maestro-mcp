@@ -148,20 +148,24 @@ register_tools(mcp, CONFIG)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _audit_log_path = Path.home() / ".maestro" / "audit.log"
-    _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-    _audit_handler = logging.FileHandler(_audit_log_path)
-    _audit_handler.setFormatter(logging.Formatter("%(message)s"))
-    _audit_logger = logging.getLogger("maestro-audit")
-    _audit_logger.addHandler(_audit_handler)
-    _audit_logger.setLevel(logging.INFO)
-    _audit_logger.propagate = False
-
     parser = argparse.ArgumentParser(description="Maestro MCP server")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+
+    _audit_log_path = Path.home() / ".maestro" / "audit.log"
+    _audit_logger = logging.getLogger("maestro-audit")
+    try:
+        _audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        _audit_handler = logging.FileHandler(_audit_log_path)
+    except OSError as exc:
+        logger.warning("maestro: audit logging disabled: %s", exc)
+    else:
+        _audit_handler.setFormatter(logging.Formatter("%(message)s"))
+        _audit_logger.addHandler(_audit_handler)
+        _audit_logger.setLevel(logging.INFO)
+        _audit_logger.propagate = False
 
     if args.transport == "streamable-http":
         import uvicorn

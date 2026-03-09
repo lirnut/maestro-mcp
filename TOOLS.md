@@ -103,12 +103,17 @@ Dispatch task to Gemini CLI.
 | `context_files` | list[str] | no | Files to include as `@file` references |
 | `working_dir` | string | no | Repository path (default: MAESTRO_DEFAULT_REPO) |
 | `model` | string | no | Model override |
-| `mode` | string | no | `"analyze"` (default), `"execute"` (--yolo), or `"research"` (web search) |
+| `approval_mode` | string | no | `"plan"` (default), `"yolo"`, `"auto_edit"`, or `"default"` |
+| `resume` | string | no | Session index or `"latest"` to continue a chat |
 
-Modes:
-- **analyze** — read-only analysis with optional context files
-- **execute** — runs with `--yolo` flag, allows file modifications
-- **research** — web search grounding, ignores context_files and working_dir
+**Warning:** Resuming a session re-sends history and costs tokens for all previous turns.
+
+### `gemini_sessions`
+List previous Gemini CLI sessions on a host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | no | Host to check (default: local host) |
 
 ### `claude`
 Dispatch task to Claude Code CLI.

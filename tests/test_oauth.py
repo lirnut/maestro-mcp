@@ -12,10 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from maestro_oauth import (
     AUTH_CODE_TTL,
-    CLAUDE_AI_CALLBACK,
     MaestroOAuthProvider,
     _audit,
 )
+from mcp.server.auth.provider import RegistrationError
 
 
 @pytest.fixture
@@ -67,9 +67,10 @@ class TestRegistrationRateLimit:
             client = _make_client_info(client_id=f"client-{i}")
             await provider.register_client(client)
 
-        with pytest.raises(ValueError, match="Too many registration"):
+        with pytest.raises(RegistrationError) as exc_info:
             client = _make_client_info(client_id="client-11")
             await provider.register_client(client)
+        assert "Too many registration" in exc_info.value.error_description
 
     @pytest.mark.asyncio
     async def test_lock_prevents_race(self, provider):
@@ -111,15 +112,16 @@ class TestClientMetadataValidation:
 
 
 # ---------------------------------------------------------------------------
-# Claude.ai auto-approval
+# Trusted client auto-approval
 # ---------------------------------------------------------------------------
 
-class TestClaudeAiAutoApproval:
+class TestTrustedClientAutoApproval:
     @pytest.mark.asyncio
-    async def test_claude_ai_redirect_auto_approves(self, provider):
-        client = _make_client_info()
+    async def test_trusted_client_id_auto_approves(self, provider):
+        client = _make_client_info(client_id="trusted-client")
         await provider.register_client(client)
-        params = _make_params(redirect_uri=CLAUDE_AI_CALLBACK)
+        provider.trusted_client_ids.add(client.client_id)
+        params = _make_params()
 
         result = await provider.authorize(client, params)
 
@@ -130,7 +132,7 @@ class TestClaudeAiAutoApproval:
         assert len(provider.pending_approvals) == 0
 
     @pytest.mark.asyncio
-    async def test_non_claude_redirect_goes_to_consent(self, provider):
+    async def test_untrusted_client_goes_to_consent(self, provider):
         client = _make_client_info()
         await provider.register_client(client)
         params = _make_params(redirect_uri="https://other.example.com/callback")

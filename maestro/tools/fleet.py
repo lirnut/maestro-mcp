@@ -264,37 +264,48 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
+    async def gemini_sessions(host: str = "") -> str:
+        """List previous Gemini CLI sessions on a host."""
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+        rc, out = await _orchestra_run_cli(h, "gemini --list-sessions", timeout=15)
+        return out
+
+    @mcp.tool()
     async def gemini(
         host: str, prompt: str, context_files: list[str] | None = None,
-        working_dir: str = config.default_repo, model: str = "", mode: str = "analyze",
+        working_dir: str = config.default_repo, model: str = "",
+        approval_mode: str = "plan", resume: str = "",
     ) -> str:
-        """Dispatch task to Gemini CLI. mode: "analyze", "execute", or "research"."""
+        """Dispatch task to Gemini CLI.
+
+        approval_mode: "plan" (read-only), "yolo" (auto-approve all), "auto_edit" (auto-approve edits), "default" (prompt).
+        resume: Session index (e.g. "1") or "latest" to continue a previous chat.
+        WARNING: Resuming a session re-sends the entire history, costing tokens for all previous turns.
+        """
         ctx = get_client_context()
         timeout = config.gemini_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
-        task_id = _orchestra_task_id(prompt)
-        agent_label = "gemini_research" if mode == "research" else "gemini"
-        output_file = _orchestra_output_path(agent_label, task_id)
+        task_id = _orchestra_task_id(prompt + resume)
+        output_file = _orchestra_output_path("gemini", task_id)
 
         async def _execute() -> str:
-            if mode == "research":
-                research_prompt = (
-                    f"Research the following topic thoroughly using web search. "
-                    f"Provide a comprehensive answer with sources.\n\n{prompt}"
-                )
-                cli_cmd = f"gemini -p {shlex.quote(research_prompt)} --output-format json"
-                logger.info(f"Orchestra: gemini_research on {host} [{task_id}]: {prompt[:80]}...")
-                rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout)
-            else:
-                full_prompt = prompt
-                if context_files:
-                    file_refs = " ".join(f"@{f}" for f in context_files)
-                    full_prompt = f"{file_refs} {prompt}"
-                model_flag = f"--model {shlex.quote(model)} " if model else ""
-                yolo_flag = "--yolo " if mode == "execute" else ""
-                cli_cmd = f"gemini -p {shlex.quote(full_prompt)} --output-format json {model_flag}{yolo_flag}"
-                logger.info(f"Orchestra: gemini_{mode} on {host} [{task_id}]: {prompt[:80]}...")
-                rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
+            full_prompt = prompt
+            if context_files:
+                file_refs = " ".join(f"@{f}" for f in context_files)
+                full_prompt = f"{file_refs} {prompt}"
+
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+            approval_flag = f"--approval-mode {shlex.quote(approval_mode)} "
+            resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
+
+            cli_cmd = (
+                f"gemini -p {shlex.quote(full_prompt)} --output-format json "
+                f"{model_flag}{approval_flag}{resume_flag}"
+            )
+
+            logger.info(f"Orchestra: gemini on {host} [{task_id}]: {prompt[:80]}...")
+            rc, raw_output = await _orchestra_run_cli(host, cli_cmd, timeout=timeout, cwd=working_dir)
             return _orchestra_build_result("gemini", host, prompt, _extract_gemini_response(raw_output), rc, output_file)
 
         return await _auto_promote(
