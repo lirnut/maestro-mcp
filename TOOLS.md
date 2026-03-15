@@ -127,6 +127,26 @@ Dispatch task to Claude Code CLI.
 
 Runs with `--permission-mode bypassPermissions`.
 
+### `opencode`
+Dispatch task to OpenCode CLI.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name from fleet topology |
+| `prompt` | string | yes | Task prompt for OpenCode |
+| `working_dir` | string | no | Repository path (default: MAESTRO_DEFAULT_REPO) |
+| `model` | string | no | Model override (provider/model format) |
+| `session_id` | string | no | Session ID to continue existing session |
+
+Returns task result inline if completed within block_timeout, otherwise returns `{"auto_promoted": true, "task_id": "..."}`. Use `poll` to check status.
+
+### `opencode_sessions`
+List previous OpenCode CLI sessions on a host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | no | Host to check (default: local host) |
+
 ### `poll`
 Check task status or retrieve result.
 
