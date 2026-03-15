@@ -1,0 +1,11 @@
+# Test hosts configuration for offline persistence testing
+hosts:
+  test-remote:
+    alias: test-remote-ssh
+    description: "Docker test remote host for offline persistence"
+    is_local: false
+
+  local-test:
+    alias: localhost
+    description: "Local test (for comparison)"
+    is_local: true
