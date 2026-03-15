@@ -54,6 +54,9 @@ logger = logging.getLogger("maestro")
 
 _CONFIG: MaestroConfig | None = None
 
+# PATH fix for user-local binary installations (used in SSH non-interactive sessions)
+_PATH_FIX = "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; "
+
 
 def register_tools(mcp: object, config: MaestroConfig) -> None:
     """Register all fleet + orchestra tools on the given FastMCP instance."""
@@ -253,8 +256,6 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
 
-        _PATH_FIX = "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; "
-
         codex_rc, codex_out = await _orchestra_run_cli(
             h, f"{_PATH_FIX}codex --version 2>&1", timeout=10
         )
@@ -313,6 +314,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         - Architecture (x86_64 or arm64)
         - Required tools (curl for opencode, npm for others)
 
+        Note: Currently supports Linux/Unix hosts only. Windows PowerShell hosts
+        are not supported for remote installation.
+
         Args:
             host: Target host name from fleet topology
             agent: Agent to install (opencode, codex, gemini, claude)
@@ -336,7 +340,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             )
 
         # Check if already installed
-        check_cmd = f"{agent} --version 2>&1"
+        check_cmd = f"{_PATH_FIX}{agent} --version 2>&1"
         rc, out = await _orchestra_run_cli(h, check_cmd, timeout=10)
         if rc == 0 and not force:
             return json.dumps(
@@ -367,22 +371,25 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
         # Disk space check (need ~500MB)
         disk_rc, disk_out = await _orchestra_run_cli(
-            h, "df -BG / 2>/dev/null | tail -1", timeout=10
+            h, "df --output=avail -BG / 2>/dev/null | tail -1", timeout=10
         )
         if disk_rc == 0:
-            parts = disk_out.strip().split()
-            if len(parts) >= 4:
-                available_gb = int(parts[3].replace("G", ""))
-                checks["disk_available_gb"] = available_gb
-                if available_gb < 1:
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": f"Insufficient disk space: {available_gb}GB available, need at least 1GB",
-                            "checks": checks,
-                        },
-                        indent=2,
-                    )
+            try:
+                avail_str = disk_out.strip().replace("G", "").replace(" ", "")
+                if avail_str:
+                    available_gb = int(avail_str)
+                    checks["disk_available_gb"] = available_gb
+                    if available_gb < 1:
+                        return json.dumps(
+                            {
+                                "success": False,
+                                "error": f"Insufficient disk space: {available_gb}GB available, need at least 1GB",
+                                "checks": checks,
+                            },
+                            indent=2,
+                        )
+            except (ValueError, TypeError):
+                pass
 
         # Tool-specific requirements
         if agent == "opencode":
