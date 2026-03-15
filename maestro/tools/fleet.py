@@ -249,18 +249,23 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
-        """Check Codex/Gemini/OpenCode CLI availability on a host."""
+        """Check Codex/Gemini/OpenCode/Claude CLI availability on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
 
+        _PATH_FIX = "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; "
+
         codex_rc, codex_out = await _orchestra_run_cli(
-            h, "codex --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}codex --version 2>&1", timeout=10
         )
         gemini_rc, gemini_out = await _orchestra_run_cli(
-            h, "gemini --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}gemini --version 2>&1", timeout=10
         )
         opencode_rc, opencode_out = await _orchestra_run_cli(
-            h, "opencode --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}opencode --version 2>&1", timeout=10
+        )
+        claude_rc, claude_out = await _orchestra_run_cli(
+            h, f"{_PATH_FIX}claude --version 2>&1", timeout=10
         )
 
         output_dir = _orchestra_output_dir()
@@ -283,6 +288,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                     "available": opencode_rc == 0,
                     "output": opencode_out.strip()[:200],
                 },
+                "claude": {
+                    "available": claude_rc == 0,
+                    "output": claude_out.strip()[:200],
+                },
                 "output_dir": str(output_dir),
                 "recent_outputs": [
                     {"name": f.name, "size": f.stat().st_size} for f in recent
@@ -290,6 +299,171 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             },
             indent=2,
         )
+
+    @mcp.tool()
+    async def install_agent(
+        host: str,
+        agent: str,
+        force: bool = False,
+    ) -> str:
+        """Install a CLI agent (opencode/codex/gemini/claude) on a remote host.
+
+        This tool checks system requirements before installation:
+        - Disk space (needs ~500MB)
+        - Architecture (x86_64 or arm64)
+        - Required tools (curl for opencode, npm for others)
+
+        Args:
+            host: Target host name from fleet topology
+            agent: Agent to install (opencode, codex, gemini, claude)
+            force: Skip confirmation and install anyway
+
+        Returns:
+            Installation result with status and any error messages
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        cfg = _resolve_host(h)
+
+        agent = agent.lower().strip()
+        valid_agents = ["opencode", "codex", "gemini", "claude"]
+        if agent not in valid_agents:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unknown agent '{agent}'. Valid options: {', '.join(valid_agents)}",
+                },
+                indent=2,
+            )
+
+        # Check if already installed
+        check_cmd = f"{agent} --version 2>&1"
+        rc, out = await _orchestra_run_cli(h, check_cmd, timeout=10)
+        if rc == 0 and not force:
+            return json.dumps(
+                {
+                    "success": True,
+                    "already_installed": True,
+                    "version": out.strip()[:100],
+                    "message": f"{agent} is already installed on {h}",
+                },
+                indent=2,
+            )
+
+        # Check system requirements
+        checks = {}
+
+        # Architecture check
+        arch_rc, arch_out = await _orchestra_run_cli(h, "uname -m", timeout=10)
+        checks["architecture"] = arch_out.strip()
+        if arch_out.strip() not in ["x86_64", "aarch64", "arm64"]:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unsupported architecture: {arch_out.strip()}. Need x86_64 or arm64",
+                    "checks": checks,
+                },
+                indent=2,
+            )
+
+        # Disk space check (need ~500MB)
+        disk_rc, disk_out = await _orchestra_run_cli(
+            h, "df -BG / 2>/dev/null | tail -1", timeout=10
+        )
+        if disk_rc == 0:
+            parts = disk_out.strip().split()
+            if len(parts) >= 4:
+                available_gb = int(parts[3].replace("G", ""))
+                checks["disk_available_gb"] = available_gb
+                if available_gb < 1:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": f"Insufficient disk space: {available_gb}GB available, need at least 1GB",
+                            "checks": checks,
+                        },
+                        indent=2,
+                    )
+
+        # Tool-specific requirements
+        if agent == "opencode":
+            # OpenCode needs curl
+            curl_rc, _ = await _orchestra_run_cli(h, "which curl", timeout=10)
+            checks["curl_available"] = curl_rc == 0
+            if curl_rc != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "curl is required but not found. Install curl first.",
+                        "checks": checks,
+                    },
+                    indent=2,
+                )
+
+            install_cmd = "curl -fsSL https://opencode.ai/install | bash"
+        else:
+            # Other agents need npm
+            npm_rc, npm_out = await _orchestra_run_cli(
+                h, "which npm && npm --version", timeout=10
+            )
+            checks["npm_available"] = npm_rc == 0
+            if npm_rc != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "npm is required for codex/gemini/claude but not found. Install Node.js first.",
+                        "checks": checks,
+                    },
+                    indent=2,
+                )
+            checks["npm_version"] = npm_out.strip().split("\n")[-1][:20]
+
+            packages = {
+                "codex": "@openai/codex",
+                "gemini": "@anthropic-ai/gemini-cli",
+                "claude": "@anthropic-ai/claude-code",
+            }
+            install_cmd = f"npm install -g {packages[agent]}"
+
+        # Execute installation
+        logger.info(f"Installing {agent} on {h}: {install_cmd}")
+        install_rc, install_out = await _orchestra_run_cli(
+            h, install_cmd, timeout=300, cwd=None
+        )
+
+        if install_rc == 0:
+            # Verify installation
+            verify_rc, verify_out = await _orchestra_run_cli(
+                h, f"{agent} --version", timeout=10
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "agent": agent,
+                    "host": h,
+                    "checks": checks,
+                    "version": verify_out.strip()[:100]
+                    if verify_rc == 0
+                    else "installed (version check failed)",
+                    "output": install_out[-500:]
+                    if len(install_out) > 500
+                    else install_out,
+                },
+                indent=2,
+            )
+        else:
+            return json.dumps(
+                {
+                    "success": False,
+                    "agent": agent,
+                    "host": h,
+                    "checks": checks,
+                    "error": "Installation failed",
+                    "output": install_out[-1000:]
+                    if len(install_out) > 1000
+                    else install_out,
+                },
+                indent=2,
+            )
 
     @mcp.tool()
     async def codex(
@@ -311,7 +485,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             effort_flag = f"-c model_reasoning_effort={shlex.quote(reasoning_effort)} "
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
+            cli_cmd = f"export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; codex exec --dangerously-bypass-approvals-and-sandbox --json {model_flag}{effort_flag}-C {shlex.quote(working_dir)} {escaped_prompt}"
             logger.info(f"Orchestra: codex on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(
                 host, cli_cmd, timeout=timeout, cwd=working_dir
@@ -333,7 +507,11 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         """List previous Gemini CLI sessions on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
-        rc, out = await _orchestra_run_cli(h, "gemini --list-sessions", timeout=15)
+        rc, out = await _orchestra_run_cli(
+            h,
+            "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; gemini --list-sessions",
+            timeout=15,
+        )
         return out
 
     @mcp.tool()
@@ -342,7 +520,9 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
         rc, out = await _orchestra_run_cli(
-            h, "opencode session list --format json", timeout=15
+            h,
+            "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; opencode session list --format json",
+            timeout=15,
         )
         return out
 
@@ -366,7 +546,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             session_flag = f"-s {shlex.quote(session_id)} " if session_id else ""
             scoped_prompt = AGENT_SCOPE_PREFIX + prompt
             escaped_prompt = shlex.quote(scoped_prompt)
-            cli_cmd = f"opencode run {escaped_prompt} --format json {model_flag}{session_flag}"
+            cli_cmd = f"export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; opencode run {escaped_prompt} --format json {model_flag}{session_flag}"
             logger.info(f"Orchestra: opencode on {host} [{task_id}]: {prompt[:80]}...")
             rc, raw_output = await _orchestra_run_cli(
                 host, cli_cmd, timeout=timeout, cwd=working_dir
@@ -416,7 +596,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             resume_flag = f"--resume {shlex.quote(resume)} " if resume else ""
 
             cli_cmd = (
-                f"gemini -p {shlex.quote(full_prompt)} --output-format json "
+                f"export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; gemini -p {shlex.quote(full_prompt)} --output-format json "
                 f"{model_flag}{approval_flag}{resume_flag}"
             )
 
@@ -490,7 +670,7 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             escaped_prompt = shlex.quote(scoped_prompt)
             escaped_tools = shlex.quote(allowed_tools)
             cli_cmd = (
-                f"claude -p {escaped_prompt} --output-format json "
+                f"export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; claude -p {escaped_prompt} --output-format json "
                 f"--permission-mode bypassPermissions "
                 f"--allowedTools {escaped_tools}"
             )
