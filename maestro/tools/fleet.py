@@ -249,18 +249,23 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
-        """Check Codex/Gemini/OpenCode CLI availability on a host."""
+        """Check Codex/Gemini/OpenCode/Claude CLI availability on a host."""
         h = host or _local_host_name() or next(iter(HOSTS))
         _resolve_host(h)
 
+        _PATH_FIX = "export PATH=$PATH:~/.local/bin:~/bin 2>/dev/null; "
+
         codex_rc, codex_out = await _orchestra_run_cli(
-            h, "codex --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}codex --version 2>&1", timeout=10
         )
         gemini_rc, gemini_out = await _orchestra_run_cli(
-            h, "gemini --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}gemini --version 2>&1", timeout=10
         )
         opencode_rc, opencode_out = await _orchestra_run_cli(
-            h, "opencode --version 2>&1", timeout=10
+            h, f"{_PATH_FIX}opencode --version 2>&1", timeout=10
+        )
+        claude_rc, claude_out = await _orchestra_run_cli(
+            h, f"{_PATH_FIX}claude --version 2>&1", timeout=10
         )
 
         output_dir = _orchestra_output_dir()
@@ -282,6 +287,10 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 "opencode": {
                     "available": opencode_rc == 0,
                     "output": opencode_out.strip()[:200],
+                },
+                "claude": {
+                    "available": claude_rc == 0,
+                    "output": claude_out.strip()[:200],
                 },
                 "output_dir": str(output_dir),
                 "recent_outputs": [
