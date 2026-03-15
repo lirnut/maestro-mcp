@@ -292,6 +292,171 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     @mcp.tool()
+    async def install_agent(
+        host: str,
+        agent: str,
+        force: bool = False,
+    ) -> str:
+        """Install a CLI agent (opencode/codex/gemini/claude) on a remote host.
+
+        This tool checks system requirements before installation:
+        - Disk space (needs ~500MB)
+        - Architecture (x86_64 or arm64)
+        - Required tools (curl for opencode, npm for others)
+
+        Args:
+            host: Target host name from fleet topology
+            agent: Agent to install (opencode, codex, gemini, claude)
+            force: Skip confirmation and install anyway
+
+        Returns:
+            Installation result with status and any error messages
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        cfg = _resolve_host(h)
+
+        agent = agent.lower().strip()
+        valid_agents = ["opencode", "codex", "gemini", "claude"]
+        if agent not in valid_agents:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unknown agent '{agent}'. Valid options: {', '.join(valid_agents)}",
+                },
+                indent=2,
+            )
+
+        # Check if already installed
+        check_cmd = f"{agent} --version 2>&1"
+        rc, out = await _orchestra_run_cli(h, check_cmd, timeout=10)
+        if rc == 0 and not force:
+            return json.dumps(
+                {
+                    "success": True,
+                    "already_installed": True,
+                    "version": out.strip()[:100],
+                    "message": f"{agent} is already installed on {h}",
+                },
+                indent=2,
+            )
+
+        # Check system requirements
+        checks = {}
+
+        # Architecture check
+        arch_rc, arch_out = await _orchestra_run_cli(h, "uname -m", timeout=10)
+        checks["architecture"] = arch_out.strip()
+        if arch_out.strip() not in ["x86_64", "aarch64", "arm64"]:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unsupported architecture: {arch_out.strip()}. Need x86_64 or arm64",
+                    "checks": checks,
+                },
+                indent=2,
+            )
+
+        # Disk space check (need ~500MB)
+        disk_rc, disk_out = await _orchestra_run_cli(
+            h, "df -BG / 2>/dev/null | tail -1", timeout=10
+        )
+        if disk_rc == 0:
+            parts = disk_out.strip().split()
+            if len(parts) >= 4:
+                available_gb = int(parts[3].replace("G", ""))
+                checks["disk_available_gb"] = available_gb
+                if available_gb < 1:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": f"Insufficient disk space: {available_gb}GB available, need at least 1GB",
+                            "checks": checks,
+                        },
+                        indent=2,
+                    )
+
+        # Tool-specific requirements
+        if agent == "opencode":
+            # OpenCode needs curl
+            curl_rc, _ = await _orchestra_run_cli(h, "which curl", timeout=10)
+            checks["curl_available"] = curl_rc == 0
+            if curl_rc != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "curl is required but not found. Install curl first.",
+                        "checks": checks,
+                    },
+                    indent=2,
+                )
+
+            install_cmd = "curl -fsSL https://opencode.ai/install | bash"
+        else:
+            # Other agents need npm
+            npm_rc, npm_out = await _orchestra_run_cli(
+                h, "which npm && npm --version", timeout=10
+            )
+            checks["npm_available"] = npm_rc == 0
+            if npm_rc != 0:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "npm is required for codex/gemini/claude but not found. Install Node.js first.",
+                        "checks": checks,
+                    },
+                    indent=2,
+                )
+            checks["npm_version"] = npm_out.strip().split("\n")[-1][:20]
+
+            packages = {
+                "codex": "@openai/codex",
+                "gemini": "@anthropic-ai/gemini-cli",
+                "claude": "@anthropic-ai/claude-code",
+            }
+            install_cmd = f"npm install -g {packages[agent]}"
+
+        # Execute installation
+        logger.info(f"Installing {agent} on {h}: {install_cmd}")
+        install_rc, install_out = await _orchestra_run_cli(
+            h, install_cmd, timeout=300, cwd=None
+        )
+
+        if install_rc == 0:
+            # Verify installation
+            verify_rc, verify_out = await _orchestra_run_cli(
+                h, f"{agent} --version", timeout=10
+            )
+            return json.dumps(
+                {
+                    "success": True,
+                    "agent": agent,
+                    "host": h,
+                    "checks": checks,
+                    "version": verify_out.strip()[:100]
+                    if verify_rc == 0
+                    else "installed (version check failed)",
+                    "output": install_out[-500:]
+                    if len(install_out) > 500
+                    else install_out,
+                },
+                indent=2,
+            )
+        else:
+            return json.dumps(
+                {
+                    "success": False,
+                    "agent": agent,
+                    "host": h,
+                    "checks": checks,
+                    "error": "Installation failed",
+                    "output": install_out[-1000:]
+                    if len(install_out) > 1000
+                    else install_out,
+                },
+                indent=2,
+            )
+
+    @mcp.tool()
     async def codex(
         host: str,
         prompt: str,
