@@ -193,6 +193,71 @@ Checks system requirements before installation:
 
 Returns installation result with status and version info.
 
+## Persistent Session Tools
+
+These tools provide offline persistence for CLI sessions using tmux. Sessions survive Maestro disconnection and can be reconnected later.
+
+### `create_persistent_session`
+Create a persistent CLI session that survives disconnection.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name from fleet topology |
+| `agent` | string | yes | Agent to use: `opencode`, `codex`, `gemini`, or `claude` |
+| `prompt` | string | yes | Task prompt for the agent |
+| `session_id` | string | no | Optional session ID (auto-generated if not provided) |
+
+Returns JSON with `session_id` and `status`.
+
+### `get_persistent_session`
+Get status and result of a persistent session.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name |
+| `session_id` | string | yes | Session ID to check |
+
+Returns JSON with session status and result (if completed).
+
+### `list_persistent_sessions`
+List persistent sessions on a host.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | no | Target host name (default: local host) |
+| `status` | string | no | Filter by status: `pending`, `running`, `completed`, `failed` |
+
+Returns JSON array of sessions.
+
+### `kill_persistent_session`
+Kill a persistent session.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name |
+| `session_id` | string | yes | Session ID to kill |
+
+Returns JSON with success status.
+
+### `sync_persistent_sessions`
+Synchronize session states with actual tmux sessions on host reconnect.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | no | Target host name (default: local host) |
+
+Call this after reconnecting to a host to detect orphaned/completed sessions.
+
+### `recover_persistent_session`
+Attempt to recover a failed session by restarting it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `host` | string | yes | Target host name |
+| `session_id` | string | yes | Session ID to recover |
+
+Returns JSON with recovery status.
+
 ## Auto-Promote Behavior
 
 All execution tools use adaptive blocking based on client classification:
