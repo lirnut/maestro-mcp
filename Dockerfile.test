@@ -1,0 +1,52 @@
+# Dockerfile for testing remote Code CLI offline persistence
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    tmux \
+    curl \
+    git \
+    python3 \
+    python3-pip \
+    nodejs \
+    npm \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create test user
+RUN useradd -m -s /bin/bash testuser && \
+    echo "testuser:testpass" | chpasswd && \
+    usermod -aG sudo testuser
+
+# Configure SSH
+RUN mkdir -p /var/run/sshd && \
+    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
+    echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
+    echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+
+# Install OpenCode CLI as testuser
+USER testuser
+WORKDIR /home/testuser
+
+# Install OpenCode CLI
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Set PATH for user-local binaries
+ENV PATH="/home/testuser/.local/bin:/home/testuser/.opencode/bin:${PATH}"
+
+# Install npm-based CLI tools (optional, for testing)
+RUN npm install -g @openai/codex 2>/dev/null || true
+
+# Create necessary directories
+RUN mkdir -p /home/testuser/workspace && \
+    mkdir -p /home/testuser/.maestro/sessions
+
+# Switch back to root for SSH daemon
+USER root
+EXPOSE 22
+
+# Start SSH daemon
+CMD ["/usr/sbin/sshd", "-D"]

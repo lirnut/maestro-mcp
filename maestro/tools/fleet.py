@@ -49,6 +49,7 @@ from maestro.transport import (
     _ssh_run,
     _warmup_connection,
 )
+from maestro.session_manager import RemoteSessionManager, SessionInfo
 
 logger = logging.getLogger("maestro")
 
@@ -56,6 +57,17 @@ _CONFIG: MaestroConfig | None = None
 
 # PATH fix for user-local binary installations (used in SSH non-interactive sessions)
 _PATH_FIX = "export PATH=$PATH:~/.local/bin:~/bin:~/.opencode/bin 2>/dev/null; "
+
+# Session managers cache per host
+_SESSION_MANAGERS: dict[str, RemoteSessionManager] = {}
+
+
+def _get_session_manager(host: str) -> RemoteSessionManager:
+    """Get or create a session manager for a host."""
+    assert _CONFIG is not None, "MaestroConfig not initialized"
+    if host not in _SESSION_MANAGERS:
+        _SESSION_MANAGERS[host] = RemoteSessionManager(host, _CONFIG)
+    return _SESSION_MANAGERS[host]
 
 
 def register_tools(mcp: object, config: MaestroConfig) -> None:
@@ -730,4 +742,233 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                 "status": "running",
                 "elapsed_seconds": round(elapsed, 1),
             }
+        )
+
+    # --- Persistent Session Tools ---
+
+    @mcp.tool()
+    async def create_persistent_session(
+        host: str,
+        agent: str,
+        prompt: str,
+        session_id: str = "",
+    ) -> str:
+        """Create a persistent CLI session that survives disconnection.
+
+        Args:
+            host: Target host name from fleet topology
+            agent: Agent to use (opencode, codex, gemini, claude)
+            prompt: Task prompt for the agent
+            session_id: Optional session ID (auto-generated if not provided)
+
+        Returns:
+            JSON with session_id and status
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+
+        actual_session_id = sm.create_session(
+            agent=agent.lower().strip(),
+            prompt=prompt,
+            session_id=session_id if session_id else None,
+        )
+
+        async def exec_wrapper(host: str, command: str) -> str:
+            cfg = _resolve_host(host)
+            if cfg.is_local:
+                return await _local_run(command, timeout=30)
+            return await _ssh_run(host, [command], timeout=30)
+
+        started = await sm.start_session(actual_session_id, exec_wrapper)
+
+        return json.dumps(
+            {
+                "session_id": actual_session_id,
+                "host": h,
+                "agent": agent,
+                "status": "running" if started else "failed",
+            },
+            indent=2,
+        )
+
+    @mcp.tool()
+    async def get_persistent_session(host: str, session_id: str) -> str:
+        """Get status and result of a persistent session.
+
+        Args:
+            host: Target host name
+            session_id: Session ID to check
+
+        Returns:
+            JSON with session status and result (if completed)
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+        session = sm.get_session(session_id)
+
+        if session is None:
+            return json.dumps({"error": f"Session '{session_id}' not found"}, indent=2)
+
+        async def exec_wrapper(host: str, command: str) -> str:
+            cfg = _resolve_host(host)
+            if cfg.is_local:
+                return await _local_run(command, timeout=30)
+            return await _ssh_run(host, [command], timeout=30)
+
+        status = await sm.check_session_status(session_id, exec_wrapper)
+
+        result = {
+            "session_id": session_id,
+            "host": h,
+            "agent": session.agent,
+            "status": status,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+
+        if status == "completed" and session.output_file:
+            try:
+                output_path = Path(session.output_file)
+                if output_path.exists():
+                    result["output"] = output_path.read_text(encoding="utf-8")[-5000:]
+            except OSError:
+                pass
+
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    async def list_persistent_sessions(host: str = "", status: str = "") -> str:
+        """List persistent sessions on a host.
+
+        Args:
+            host: Target host name (default: local host)
+            status: Filter by status (pending, running, completed, failed)
+
+        Returns:
+            JSON array of sessions
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+        sessions = sm.list_sessions(status if status else None)
+
+        return json.dumps(
+            [
+                {
+                    "session_id": s.session_id,
+                    "agent": s.agent,
+                    "status": s.status,
+                    "created_at": s.created_at,
+                    "prompt": s.prompt[:100] + "..."
+                    if len(s.prompt) > 100
+                    else s.prompt,
+                }
+                for s in sessions
+            ],
+            indent=2,
+        )
+
+    @mcp.tool()
+    async def kill_persistent_session(host: str, session_id: str) -> str:
+        """Kill a persistent session.
+
+        Args:
+            host: Target host name
+            session_id: Session ID to kill
+
+        Returns:
+            JSON with success status
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+
+        async def exec_wrapper(host: str, command: str) -> str:
+            cfg = _resolve_host(host)
+            if cfg.is_local:
+                return await _local_run(command, timeout=30)
+            return await _ssh_run(host, [command], timeout=30)
+
+        killed = await sm.kill_session_process(session_id, exec_wrapper)
+
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "killed": killed,
+            },
+            indent=2,
+        )
+
+    @mcp.tool()
+    async def sync_persistent_sessions(host: str = "") -> str:
+        """Synchronize session states with actual tmux sessions on host reconnect.
+
+        Call this after reconnecting to a host to detect orphaned/completed sessions.
+
+        Args:
+            host: Target host name (default: local host)
+
+        Returns:
+            JSON with list of updated sessions
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+
+        async def exec_wrapper(host: str, command: str) -> str:
+            cfg = _resolve_host(host)
+            if cfg.is_local:
+                return await _local_run(command, timeout=30)
+            return await _ssh_run(host, [command], timeout=30)
+
+        updated = await sm.sync_session_states(exec_wrapper)
+
+        return json.dumps(
+            {
+                "host": h,
+                "updated_count": len(updated),
+                "updated_sessions": [
+                    {"session_id": s.session_id, "status": s.status} for s in updated
+                ],
+            },
+            indent=2,
+        )
+
+    @mcp.tool()
+    async def recover_persistent_session(host: str, session_id: str) -> str:
+        """Attempt to recover a failed session by restarting it.
+
+        Args:
+            host: Target host name
+            session_id: Session ID to recover
+
+        Returns:
+            JSON with recovery status
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        _resolve_host(h)
+
+        sm = _get_session_manager(h)
+
+        async def exec_wrapper(host: str, command: str) -> str:
+            cfg = _resolve_host(host)
+            if cfg.is_local:
+                return await _local_run(command, timeout=30)
+            return await _ssh_run(host, [command], timeout=30)
+
+        recovered = await sm.recover_session(session_id, exec_wrapper)
+
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "recovered": recovered,
+            },
+            indent=2,
         )
