@@ -299,7 +299,8 @@ class RemoteSessionManager:
 
     async def start_session(self, session_id: str, exec_fn: Callable) -> bool:
         """
-        Start a tmux session for the CLI process.
+        Start a persistent session for the CLI process.
+        Uses tmux if available, falls back to nohup otherwise.
 
         Args:
             session_id: Session ID
@@ -319,26 +320,40 @@ class RemoteSessionManager:
         output_file = self._session_base_dir / f"{session_id}.out"
         session.output_file = str(output_file)
 
-        # Create tmux session name
-        tmux_session_name = f"maestro-{session_id}"
+        # PID file for tracking process
+        pid_file = self._session_base_dir / f"{session_id}.pid"
 
-        # Command to run in tmux: save output to file, then exit
-        tmux_cmd = (
-            f"bash -c '{cli_cmd} 2>&1 | tee {shlex.quote(str(output_file))}; "
-            f"exit_code=$?; "
-            f"tmux kill-session -t {shlex.quote(tmux_session_name)} || true; "
-            f"exit $exit_code'"
-        )
+        # Check if tmux is available
+        check_tmux = "which tmux 2>/dev/null && echo yes || echo no"
+        try:
+            tmux_check = await exec_fn(host=self.host, command=check_tmux)
+            has_tmux = "yes" in tmux_check
+        except Exception:
+            has_tmux = False
 
-        # Start tmux session with the command
-        start_tmux_cmd = (
-            f"tmux new-session -d -s {shlex.quote(tmux_session_name)} '{tmux_cmd}'"
-        )
+        if has_tmux:
+            # Use tmux for persistence
+            tmux_session_name = f"maestro-{session_id}"
+            tmux_cmd = (
+                f"bash -c '{cli_cmd} 2>&1 | tee {shlex.quote(str(output_file))}; "
+                f"exit_code=$?; "
+                f"tmux kill-session -t {shlex.quote(tmux_session_name)} || true; "
+                f"exit $exit_code'"
+            )
+            start_cmd = (
+                f"tmux new-session -d -s {shlex.quote(tmux_session_name)} '{tmux_cmd}'"
+            )
+            session.tmux_session = tmux_session_name
+        else:
+            # Fallback to nohup
+            start_cmd = (
+                f"nohup bash -c '{cli_cmd}' > {shlex.quote(str(output_file))} 2>&1 & "
+                f"echo $! > {shlex.quote(str(pid_file))} && disown"
+            )
+            session.tmux_session = None
 
         try:
-            # Execute the tmux start command
-            result = await exec_fn(host=self.host, command=start_tmux_cmd)
-            session.tmux_session = tmux_session_name
+            await exec_fn(host=self.host, command=start_cmd)
             session.status = "running"
             session.updated_at = self._now()
             self._save_session(session)
@@ -351,7 +366,7 @@ class RemoteSessionManager:
 
     async def check_session_status(self, session_id: str, exec_fn: Callable) -> str:
         """
-        Check if tmux session is still running.
+        Check if session is still running (tmux or nohup).
 
         Args:
             session_id: Session ID
@@ -365,28 +380,43 @@ class RemoteSessionManager:
             return "unknown"
 
         tmux_session_name = session.tmux_session
-        if not tmux_session_name:
-            # No tmux session, check if output file exists (completed)
-            if session.output_file and Path(session.output_file).exists():
-                return "completed"
-            return "failed"
 
-        # Check if tmux session exists
-        check_cmd = f"tmux has-session -t {shlex.quote(tmux_session_name)} 2>/dev/null && echo exists || echo absent"
-        result = await exec_fn(host=self.host, command=check_cmd)
+        if tmux_session_name:
+            # Check tmux session
+            check_cmd = f"tmux has-session -t {shlex.quote(tmux_session_name)} 2>/dev/null && echo exists || echo absent"
+            result = await exec_fn(host=self.host, command=check_cmd)
 
-        if "exists" in result:
-            session.status = "running"
-            session.updated_at = self._now()
-            self._save_session(session)
-            return "running"
+            if "exists" in result:
+                session.status = "running"
+                session.updated_at = self._now()
+                self._save_session(session)
+                return "running"
+        else:
+            # Check nohup process via PID file
+            pid_file = self._session_base_dir / f"{session_id}.pid"
+            check_cmd = f'PID=$(cat {shlex.quote(str(pid_file))} 2>/dev/null); if [ -n "$PID" ] && ps -p $PID > /dev/null 2>&1; then echo running; else echo stopped; fi'
+            try:
+                result = await exec_fn(host=self.host, command=check_cmd)
+                if "running" in result:
+                    session.status = "running"
+                    session.updated_at = self._now()
+                    self._save_session(session)
+                    return "running"
+            except Exception:
+                pass
 
-        # Session not running, check output file
-        if session.output_file and Path(session.output_file).exists():
-            session.status = "completed"
-            session.updated_at = self._now()
-            self._save_session(session)
-            return "completed"
+        # Process not running, check output file to determine final status
+        if session.output_file:
+            check_output = f"test -s {shlex.quote(session.output_file)} && echo exists || echo empty"
+            try:
+                result = await exec_fn(host=self.host, command=check_output)
+                if "exists" in result:
+                    session.status = "completed"
+                    session.updated_at = self._now()
+                    self._save_session(session)
+                    return "completed"
+            except Exception:
+                pass
 
         session.status = "failed"
         session.updated_at = self._now()
