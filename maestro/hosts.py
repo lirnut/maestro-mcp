@@ -35,6 +35,13 @@ class HostShell(Enum):
     POWERSHELL = "powershell"
 
 
+class RemoteCLI(Enum):
+    OPENCODE = "opencode"
+    CODEX = "codex"
+    GEMINI = "gemini"
+    CLAUDE = "claude"
+
+
 @dataclass
 class HostConfig:
     alias: str
@@ -48,12 +55,14 @@ class HostConfig:
     # Authentication
     password: str = ""
     auto_deploy_key: bool = True
+    key_passphrase: str = ""
     # SSH connection params (parsed from ~/.ssh/config)
     hostname: str = ""
     port: int = 22
     user: str = ""
     key_path: str = ""
-    key_passphrase: str = ""
+    # Remote CLI preference
+    remote_cli: RemoteCLI = RemoteCLI.OPENCODE
 
 
 def _parse_ssh_config(alias: str) -> dict[str, Any]:
@@ -163,6 +172,14 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
                 f"Invalid shell '{shell_str}' for host '{name}'. "
                 f"Valid options: {', '.join(s.value for s in HostShell)}"
             )
+        cli_str = cfg.get("remote_cli", "opencode").lower()
+        try:
+            remote_cli = RemoteCLI(cli_str)
+        except ValueError:
+            raise SystemExit(
+                f"Invalid remote_cli '{cli_str}' for host '{name}'. "
+                f"Valid options: {', '.join(s.value for s in RemoteCLI)}"
+            )
         hosts[name] = HostConfig(
             alias=cfg["alias"],
             display_name=cfg.get("display_name", name),
@@ -171,6 +188,8 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
             is_local=cfg.get("is_local", False),
             password=cfg.get("password", ""),
             auto_deploy_key=cfg.get("auto_deploy_key", True),
+            key_passphrase=cfg.get("key_passphrase", ""),
+            remote_cli=remote_cli,
         )
 
         if not hosts[name].is_local:

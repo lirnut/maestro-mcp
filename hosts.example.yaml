@@ -10,8 +10,10 @@
 #   shell: bash (default) or powershell
 #   is_local: true if this is the hub machine (direct execution, no SSH)
 #   display_name: override the display name (defaults to the YAML key)
-#   password: auto-auth password (uses sshpass, auto-deploys SSH key on success)
+#   password: server password for auto-auth
+#   key_passphrase: passphrase for encrypted SSH private key
 #   auto_deploy_key: true (default) to auto-deploy public key after password auth
+#   remote_cli: default CLI for this host (opencode/codex/gemini/claude, default: opencode)
 
 hosts:
   workstation:
@@ -22,6 +24,7 @@ hosts:
   gpu-box:
     alias: ssh-gpu
     description: "Training rig, Ubuntu 24.04"
+    remote_cli: codex
 
   macbook:
     alias: ssh-macbook
@@ -40,5 +43,19 @@ hosts:
   # remote-server:
   #   alias: ssh-remote
   #   description: "Remote server with password auth"
-  #   password: "your-password-here"
-  #   auto_deploy_key: true  # Auto-deploy SSH key on first successful connection
+  #   password: "your-server-password"
+  #   auto_deploy_key: true
+
+  # Example with encrypted private key
+  # secure-server:
+  #   alias: ssh-secure
+  #   description: "Server with encrypted SSH key"
+  #   key_passphrase: "your-key-passphrase"
+
+  # Example with full config
+  # production:
+  #   alias: ssh-prod
+  #   description: "Production server"
+  #   password: "server-password"
+  #   key_passphrase: "key-passphrase"
+  #   remote_cli: gemini
