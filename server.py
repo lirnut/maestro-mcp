@@ -15,7 +15,11 @@ from pathlib import Path
 
 from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.auth.settings import (
+    AuthSettings,
+    ClientRegistrationOptions,
+    RevocationOptions,
+)
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import Response
@@ -80,17 +84,24 @@ _oauth_provider = MaestroOAuthProvider(
 
 # Wire up modules
 configure_transport(
-    config=CONFIG, hosts=HOSTS, locks=_HOST_LOCKS,
+    config=CONFIG,
+    hosts=HOSTS,
+    locks=_HOST_LOCKS,
     update_host_status=_update_host_status,
-    resolve_host=_resolve_host, host_status=HostStatus,
+    resolve_host=_resolve_host,
     format_result=_format_result,
 )
 configure_local(config=CONFIG, format_result=_format_result)
 configure_orchestra(
-    config=CONFIG, resolve_host=_resolve_host, wrap_command=_wrap_command,
-    format_result=_format_result, update_host_status=_update_host_status,
-    host_status=HostStatus, ensure_connection=_ensure_connection,
-    teardown_connection=_teardown_connection, async_run=_async_run,
+    config=CONFIG,
+    resolve_host=_resolve_host,
+    wrap_command=_wrap_command,
+    format_result=_format_result,
+    update_host_status=_update_host_status,
+    host_status=HostStatus,
+    ensure_connection=_ensure_connection,
+    teardown_connection=_teardown_connection,
+    async_run=_async_run,
     is_transient_failure=_is_transient_failure,
 )
 configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run)
@@ -99,8 +110,11 @@ configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run)
 # MCP Server
 # ---------------------------------------------------------------------------
 
+
 def _build_instructions() -> str:
-    dispatch_rule = "All dispatch tools return a task_id. Use poll(task_id) for results."
+    dispatch_rule = (
+        "All dispatch tools return a task_id. Use poll(task_id) for results."
+    )
     host_list = ", ".join(HOSTS.keys())
     instructions = f"Hosts: {host_list}. {dispatch_rule}"
     if len(instructions) <= 300:
@@ -119,7 +133,9 @@ mcp = FastMCP(
         issuer_url=AnyHttpUrl(CONFIG.issuer_url),
         resource_server_url=AnyHttpUrl(f"{CONFIG.issuer_url}/mcp"),
         client_registration_options=ClientRegistrationOptions(
-            enabled=True, valid_scopes=["maestro"], default_scopes=["maestro"],
+            enabled=True,
+            valid_scopes=["maestro"],
+            default_scopes=["maestro"],
         ),
         revocation_options=RevocationOptions(enabled=True),
         required_scopes=["maestro"],
@@ -128,18 +144,22 @@ mcp = FastMCP(
     instructions=_build_instructions(),
 )
 
+
 # Register routes and tools
 @mcp.custom_route("/approve", methods=["GET", "POST"])
 async def _approve_route(request: Request) -> Response:
     return await _oauth_provider.handle_approve(request)
 
+
 @mcp.custom_route("/transfer/push", methods=["POST"])
 async def _transfer_push(request: Request) -> Response:
     return await transfer_push(request)
 
+
 @mcp.custom_route("/transfer/pull", methods=["GET"])
 async def _transfer_pull(request: Request) -> Response:
     return await transfer_pull(request)
+
 
 register_tools(mcp, CONFIG)
 
@@ -149,7 +169,9 @@ register_tools(mcp, CONFIG)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Maestro MCP server")
-    parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
+    parser.add_argument(
+        "--transport", choices=["stdio", "streamable-http"], default="streamable-http"
+    )
     parser.add_argument("--port", type=int, default=8222)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
@@ -171,7 +193,12 @@ if __name__ == "__main__":
         import uvicorn
         from oauth_rewrite import OAuthURLRewriteMiddleware, _parse_lan_origins
         from urllib.parse import urlparse as _urlparse
-        from starlette.types import ASGIApp as _ASGIApp, Receive as _Recv, Scope as _Scp, Send as _Snd
+        from starlette.types import (
+            ASGIApp as _ASGIApp,
+            Receive as _Recv,
+            Scope as _Scp,
+            Send as _Snd,
+        )
 
         app = mcp.streamable_http_app()
 
@@ -182,8 +209,12 @@ if __name__ == "__main__":
             "localhost:8222": "http://localhost:8222",
             "127.0.0.1:8222": "http://127.0.0.1:8222",
         }
-        _allowed_origins.update(_parse_lan_origins(os.environ.get("MAESTRO_LAN_ORIGINS", "")))
-        app = OAuthURLRewriteMiddleware(app, CONFIG.issuer_url, allowed_origins=_allowed_origins)
+        _allowed_origins.update(
+            _parse_lan_origins(os.environ.get("MAESTRO_LAN_ORIGINS", ""))
+        )
+        app = OAuthURLRewriteMiddleware(
+            app, CONFIG.issuer_url, allowed_origins=_allowed_origins
+        )
 
         # Logging + client context middleware
         class _MaestroMiddleware:
@@ -199,8 +230,13 @@ if __name__ == "__main__":
                 method = scope.get("method", "?")
                 auth = hdrs.get(b"authorization", b"").decode(errors="replace")
                 ua = hdrs.get(b"user-agent", b"").decode(errors="replace")
-                logger.info("recv: %s %s auth=%s ua=%s", method, path,
-                            auth[:40] + "..." if len(auth) > 40 else (auth or "none"), ua[:60])
+                logger.info(
+                    "recv: %s %s auth=%s ua=%s",
+                    method,
+                    path,
+                    auth[:40] + "..." if len(auth) > 40 else (auth or "none"),
+                    ua[:60],
+                )
                 request = Request(scope, receive, send)
                 set_client_context(request)
                 await self.inner(scope, receive, send)
@@ -208,8 +244,14 @@ if __name__ == "__main__":
         app = _MaestroMiddleware(app)
         logger.info(f"maestro: starting HTTP server on {args.host}:{args.port}")
 
-        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info",
-                                proxy_headers=True, forwarded_allow_ips="*")
+        config = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
         server = uvicorn.Server(config)
 
         async def _serve_with_maestro_lifecycle() -> None:

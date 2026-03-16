@@ -11,6 +11,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+try:
+    from asyncssh.config import SSHClientConfig
+
+    HAS_ASYNCSSH_CONFIG = True
+except ImportError:
+    HAS_ASYNCSSH_CONFIG = False
+
 
 class HostStatus(Enum):
     UNKNOWN = "unknown"
@@ -34,6 +41,57 @@ class HostConfig:
     status: HostStatus = HostStatus.UNKNOWN
     last_check: float = 0.0
     last_error: str = ""
+    # Authentication
+    password: str = ""
+    auto_deploy_key: bool = True
+    # SSH connection params (parsed from ~/.ssh/config)
+    hostname: str = ""
+    port: int = 22
+    user: str = ""
+    key_path: str = ""
+    key_passphrase: str = ""
+
+
+def _parse_ssh_config(alias: str) -> dict[str, Any]:
+    """Parse SSH config for a given host alias."""
+    config_path = Path.home() / ".ssh" / "config"
+    if not config_path.exists():
+        return {}
+
+    result: dict[str, Any] = {}
+    current_host: str | None = None
+    in_target = False
+
+    with open(config_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+
+            key, value = parts[0].lower(), parts[1]
+
+            if key == "host":
+                hosts = value.split()
+                in_target = alias in hosts
+                continue
+
+            if not in_target:
+                continue
+
+            if key == "hostname":
+                result["hostname"] = value
+            elif key == "port":
+                result["port"] = int(value)
+            elif key == "user":
+                result["user"] = value
+            elif key in ("identityfile", "key_path"):
+                result["key_path"] = value.replace("~", str(Path.home()))
+
+    return result
 
 
 def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
@@ -51,12 +109,16 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
         raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict) or "hosts" not in raw:
-        raise SystemExit(f"Invalid hosts.yaml: expected top-level 'hosts' key in {config_path}")
+        raise SystemExit(
+            f"Invalid hosts.yaml: expected top-level 'hosts' key in {config_path}"
+        )
 
     hosts: dict[str, HostConfig] = {}
     for name, cfg in raw["hosts"].items():
         if not isinstance(cfg, dict) or "alias" not in cfg:
-            raise SystemExit(f"Invalid host '{name}' in {config_path}: 'alias' is required")
+            raise SystemExit(
+                f"Invalid host '{name}' in {config_path}: 'alias' is required"
+            )
         shell_str = cfg.get("shell", "bash").lower()
         try:
             shell = HostShell(shell_str)
@@ -71,7 +133,16 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
             description=cfg.get("description", ""),
             shell=shell,
             is_local=cfg.get("is_local", False),
+            password=cfg.get("password", ""),
+            auto_deploy_key=cfg.get("auto_deploy_key", True),
         )
+
+        if not hosts[name].is_local:
+            ssh_config = _parse_ssh_config(cfg["alias"])
+            hosts[name].hostname = ssh_config.get("hostname", "")
+            hosts[name].port = ssh_config.get("port", 22)
+            hosts[name].user = ssh_config.get("user", "")
+            hosts[name].key_path = ssh_config.get("key_path", "")
 
     if not hosts:
         raise SystemExit(f"No hosts defined in {config_path}")
@@ -128,6 +199,7 @@ def _resolve_host(host: str) -> HostConfig:
 # Command helpers
 # ---------------------------------------------------------------------------
 
+
 def _format_result(stdout: str, stderr: str, returncode: int) -> str:
     parts = []
     if stdout:
@@ -141,7 +213,7 @@ def _format_result(stdout: str, stderr: str, returncode: int) -> str:
 
 def _ps_quote(value: str) -> str:
     """Quote a value for PowerShell using double quotes with backtick escaping."""
-    escaped = value.replace('`', '``').replace('"', '`"').replace('$', '`$')
+    escaped = value.replace("`", "``").replace('"', '`"').replace("$", "`$")
     return f'"{escaped}"'
 
 
