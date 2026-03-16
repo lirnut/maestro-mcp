@@ -168,3 +168,84 @@ async def _ensure_connection(alias: str, host_name: str) -> bool:
 async def _teardown_connection(alias: str) -> None:
     pool = get_ssh_pool()
     await pool.close_connection(alias)
+
+
+TRANSIENT_INDICATORS = [
+    "Connection refused",
+    "Connection timed out",
+    "Connection reset",
+    "Broken pipe",
+    "No route to host",
+    "Network is unreachable",
+    "ssh_exchange_identification",
+    "Connection closed by remote host",
+]
+
+
+def _is_transient_failure(returncode: int, stderr: str) -> bool:
+    if returncode not in (-1, 255):
+        return False
+    return any(ind in stderr for ind in TRANSIENT_INDICATORS)
+
+
+async def _async_run(
+    args: list[str],
+    timeout: int = 300,
+    stdin_data: str | None = None,
+) -> tuple[int, str, str]:
+    """Execute a command, using SSH pool for ssh commands or subprocess for others."""
+    if args and args[0] == "ssh" and len(args) >= 2:
+        alias = args[1]
+        command = " ".join(args[2:]) if len(args) > 2 else "true"
+
+        host_name = None
+        for name, cfg in _HOSTS.items():
+            if hasattr(cfg, "alias") and cfg.alias == alias:
+                host_name = name
+                break
+
+        if host_name:
+            config = _HOSTS[host_name]
+            if config.is_local:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=timeout,
+                )
+                return (
+                    proc.returncode or 0,
+                    stdout_bytes.decode(errors="replace"),
+                    stderr_bytes.decode(errors="replace"),
+                )
+
+            pool = get_ssh_pool()
+            params = _get_ssh_params(config)
+            try:
+                rc, stdout, stderr = await pool.run_command(
+                    host_name, params, command, timeout=timeout
+                )
+                return rc, stdout, stderr
+            except asyncio.TimeoutError:
+                return -1, "", f"timeout after {timeout}s"
+            except Exception as e:
+                return -1, "", str(e)
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
+    )
+    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+        proc.communicate(input=stdin_data.encode() if stdin_data else None),
+        timeout=timeout,
+    )
+    return (
+        proc.returncode or 0,
+        stdout_bytes.decode(errors="replace"),
+        stderr_bytes.decode(errors="replace"),
+    )
