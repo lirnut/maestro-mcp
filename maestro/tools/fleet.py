@@ -44,10 +44,9 @@ from maestro.tools.orchestra import (
     _orchestra_task_id,
 )
 from maestro.transport import (
-    _check_control_master,
+    _ensure_connection,
     _scp_run,
     _ssh_run,
-    _warmup_connection,
 )
 from maestro.session_manager import RemoteSessionManager, SessionInfo
 
@@ -232,18 +231,16 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             if cfg.is_local:
                 await _update_host_status(name, HostStatus.CONNECTED)
                 return {"status": "connected", "local": True}
-            alive = await _check_control_master(cfg.alias)
-            if alive:
+            try:
+                await _ensure_connection(cfg.alias, name)
                 await _update_host_status(name, HostStatus.CONNECTED)
                 return {"status": "connected", "local": False}
-            if await _warmup_connection(cfg.alias):
-                await _update_host_status(name, HostStatus.CONNECTED)
-                return {"status": "reconnected", "local": False}
-            await _update_host_status(name, HostStatus.DISCONNECTED)
-            result: dict = {"status": "offline", "local": False}
-            if cfg.last_error:
-                result["error"] = cfg.last_error
-            return result
+            except Exception:
+                await _update_host_status(name, HostStatus.DISCONNECTED)
+                result: dict = {"status": "offline", "local": False}
+                if cfg.last_error:
+                    result["error"] = cfg.last_error
+                return result
 
         results = await asyncio.gather(
             *[_check_one(name, cfg) for name, cfg in HOSTS.items()]
@@ -261,6 +258,14 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         )
 
     # --- Orchestra tools ---
+
+    async def _check_cli_available(host: str, cli: str) -> bool:
+        """Check if a CLI is available on the host."""
+        cli = cli.lower()
+        rc, _ = await _orchestra_run_cli(
+            host, f"{_PATH_FIX}{cli} --version 2>&1", timeout=10
+        )
+        return rc == 0
 
     @mcp.tool()
     async def agent_status(host: str = "") -> str:
@@ -972,3 +977,83 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             },
             indent=2,
         )
+
+    # --- Smart Run Tool ---
+
+    @mcp.tool()
+    async def run(
+        host: str,
+        prompt: str,
+        working_dir: str = config.default_repo,
+        model: str = "",
+        session_id: str = "",
+    ) -> str:
+        """Dispatch task using host's preferred CLI with fallback.
+
+        Uses the host's configured remote_cli (default: opencode).
+        If that CLI is not available, returns options to install it
+        or use an alternative CLI.
+
+        Args:
+            host: Target host name from fleet topology
+            prompt: Task prompt for the agent
+            working_dir: Working directory on the remote host
+            model: Model to use (CLI-specific)
+            session_id: Session ID to resume (for opencode/gemini)
+
+        Returns:
+            Task result or options for user to choose
+        """
+        h = host or _local_host_name() or next(iter(HOSTS))
+        cfg = _resolve_host(h)
+
+        preferred_cli = (
+            cfg.remote_cli.value if hasattr(cfg, "remote_cli") else "opencode"
+        )
+
+        available = await _check_cli_available(h, preferred_cli)
+
+        if available:
+            logger.info(f"Using preferred CLI '{preferred_cli}' for host '{h}'")
+            if preferred_cli == "opencode":
+                return await opencode(h, prompt, working_dir, model, session_id)
+            elif preferred_cli == "codex":
+                return await codex(h, prompt, working_dir, model)
+            elif preferred_cli == "gemini":
+                return await gemini(h, prompt, working_dir)
+            elif preferred_cli == "claude":
+                return await claude(h, prompt, working_dir)
+
+        alternatives = []
+        for cli in ["opencode", "codex", "gemini", "claude"]:
+            if cli != preferred_cli:
+                if await _check_cli_available(h, cli):
+                    alternatives.append(cli)
+
+        result = {
+            "status": "cli_not_available",
+            "host": h,
+            "preferred_cli": preferred_cli,
+            "alternatives": alternatives,
+            "message": f"Preferred CLI '{preferred_cli}' is not installed on {h}.",
+            "options": [],
+        }
+
+        if alternatives:
+            result["options"].append(
+                {
+                    "action": "use_alternative",
+                    "description": f"Use an available CLI: {', '.join(alternatives)}",
+                    "hint": f'Call one of: {", ".join(alternatives)}(host="{h}", prompt="...")',
+                }
+            )
+
+        result["options"].append(
+            {
+                "action": "install_preferred",
+                "description": f"Install {preferred_cli} on {h}",
+                "hint": f'Call: install_agent(host="{h}", agent="{preferred_cli}")',
+            }
+        )
+
+        return json.dumps(result, indent=2)
