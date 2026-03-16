@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import shlex
 import time
 import yaml
@@ -10,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 try:
     from asyncssh.config import SSHClientConfig
@@ -94,10 +98,42 @@ def _parse_ssh_config(alias: str) -> dict[str, Any]:
     return result
 
 
+def _find_hosts_config() -> Path | None:
+    """Find project-level hosts.yaml with priority search.
+
+    Search order:
+    1. MAESTRO_HOSTS_PATH env var (if set and exists)
+    2. MAESTRO_PROJECT_DIR/.maestro/hosts.yaml (if env var set and exists)
+    3. Current working directory/.maestro/hosts.yaml (if exists)
+    4. Return None to signal using global default
+    """
+    if path := os.environ.get("MAESTRO_HOSTS_PATH"):
+        p = Path(path)
+        if p.exists():
+            logger.info(f"Using MAESTRO_HOSTS_PATH: {p}")
+            return p
+
+    if proj_dir := os.environ.get("MAESTRO_PROJECT_DIR"):
+        p = Path(proj_dir) / ".maestro" / "hosts.yaml"
+        if p.exists():
+            logger.info(f"Using project-level hosts config (MAESTRO_PROJECT_DIR): {p}")
+            return p
+
+    p = Path.cwd() / ".maestro" / "hosts.yaml"
+    if p.exists():
+        logger.info(f"Using project-level hosts config (CWD): {p}")
+        return p
+
+    return None
+
+
 def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
     """Load host registry from hosts.yaml."""
     if config_path is None:
-        config_path = Path(__file__).resolve().parent.parent / "hosts.yaml"
+        config_path = _find_hosts_config()
+        if config_path is None:
+            config_path = Path(__file__).resolve().parent.parent / "hosts.yaml"
+            logger.info(f"Using global default hosts config: {config_path}")
     if not config_path.exists():
         example = config_path.parent / "hosts.example.yaml"
         msg = f"Host config not found: {config_path}"
