@@ -84,7 +84,20 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def exec(
         host: str, command: str, cwd: str | None = None, sudo: bool = False
     ) -> str:
-        """Run a command on a host."""
+        """Run a shell command on a remote or local host.
+
+        Use this for: Single commands like docker ps, git status, ls, cat, etc.
+        For multi-line scripts, use script() instead.
+
+        Args:
+            host: Host name from fleet (call status() to see available hosts)
+            command: Shell command to execute
+            cwd: Working directory (optional)
+            sudo: Run with sudo privileges
+
+        Returns:
+            Command output (stdout/stderr combined) or error message
+        """
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -113,7 +126,20 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def script(
         host: str, script: str, cwd: str | None = None, sudo: bool = False
     ) -> str:
-        """Run a multi-line script on a host."""
+        """Run a multi-line shell script on a host.
+
+        Use this for: Scripts with multiple commands, loops, conditionals.
+        For single commands, use exec() instead.
+
+        Args:
+            host: Host name from fleet
+            script: Multi-line bash script content
+            cwd: Working directory (optional)
+            sudo: Run with sudo privileges
+
+        Returns:
+            Script output or error message
+        """
         ctx = get_client_context()
         timeout = config.ssh_timeout
         block_timeout = ctx.profile["block_timeout_exec"]
@@ -153,7 +179,19 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def read(
         host: str, path: str, head: int | None = None, tail: int | None = None
     ) -> str:
-        """Read a file from a host."""
+        """Read a file from a host.
+
+        Use this for: Reading config files, logs, source code, etc.
+
+        Args:
+            host: Host name from fleet
+            path: File path to read
+            head: Return first N lines (optional)
+            tail: Return last N lines (optional)
+
+        Returns:
+            File content or error message
+        """
         cfg = _resolve_host(host)
         if cfg.is_local:
             return _local_read_file(path, head=head, tail=tail)
@@ -177,7 +215,20 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
     async def write(
         host: str, path: str, content: str, append: bool = False, sudo: bool = False
     ) -> str:
-        """Write content to a file on a host."""
+        """Write content to a file on a host.
+
+        Use this for: Creating/updating config files, scripts, etc.
+
+        Args:
+            host: Host name from fleet
+            path: File path to write
+            content: Content to write
+            append: Append to file instead of overwriting
+            sudo: Write with sudo privileges
+
+        Returns:
+            Success message or error
+        """
         cfg = _resolve_host(host)
         timeout = config.ssh_timeout
         if cfg.is_local:
@@ -497,7 +548,21 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         model: str = "",
         reasoning_effort: str = "xhigh",
     ) -> str:
-        """Dispatch task to Codex CLI. Returns task_id."""
+        """Dispatch an AI coding task to OpenAI Codex CLI.
+
+        Use this for: Complex reasoning tasks with OpenAI models.
+        Prefer run() to automatically use the host's configured CLI.
+
+        Args:
+            host: Host name from fleet
+            prompt: Task description for the AI agent
+            working_dir: Directory to work in
+            model: Model override (e.g., "o4-mini")
+            reasoning_effort: Thinking depth - "low", "medium", "high", "xhigh"
+
+        Returns:
+            Task ID - use poll(task_id) to check status and get results
+        """
         ctx = get_client_context()
         timeout = config.codex_timeout
         block_timeout = ctx.profile["block_timeout_agent"]
@@ -558,7 +623,21 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
         model: str = "",
         session_id: str = "",
     ) -> str:
-        """Dispatch task to OpenCode CLI. Returns task_id."""
+        """Dispatch an AI coding task to OpenCode CLI.
+
+        Use this for: General coding tasks on remote hosts.
+        Prefer run() to automatically use the host's configured CLI.
+
+        Args:
+            host: Host name from fleet
+            prompt: Task description for the AI agent
+            working_dir: Directory to work in (default: config.default_repo)
+            model: Model override (optional)
+            session_id: Resume an existing session (optional)
+
+        Returns:
+            Task ID - use poll(task_id) to check status and get results
+        """
         ctx = get_client_context()
         timeout = config.opencode_timeout
         block_timeout = ctx.profile["block_timeout_agent"]

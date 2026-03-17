@@ -112,18 +112,32 @@ configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run)
 
 
 def _build_instructions() -> str:
-    dispatch_rule = (
-        "All dispatch tools return a task_id. Use poll(task_id) for results."
-    )
     host_list = ", ".join(HOSTS.keys())
-    instructions = f"Hosts: {host_list}. {dispatch_rule}"
-    if len(instructions) <= 300:
-        return instructions
-    max_hosts_len = max(0, 300 - len("Hosts: . ") - len(dispatch_rule))
-    trimmed_hosts = host_list[:max_hosts_len]
-    if len(host_list) > max_hosts_len and max_hosts_len > 3:
-        trimmed_hosts = trimmed_hosts[:-3].rstrip(", ") + "..."
-    return f"Hosts: {trimmed_hosts}. {dispatch_rule}"[:300]
+
+    instructions = f"""Maestro: Multi-host fleet orchestration via SSH.
+
+AVAILABLE HOSTS: {host_list}
+
+QUICK START:
+1. status() - Check which hosts are connected
+2. exec(host, command) - Run shell commands
+3. read(host, path) / write(host, path, content) - File operations
+4. run(host, prompt) - Dispatch AI tasks using host's preferred CLI
+
+TOOL SELECTION:
+- exec: Single shell command (e.g., exec("bigai-pc", "docker ps"))
+- script: Multi-line bash script
+- transfer: Upload/download files (direction: "upload" or "download")
+- run: AI tasks - uses opencode/codex/gemini/claude based on host config
+
+HOST PARAMETER: Must match a host name from the list above.
+
+ERRORS:
+- "Permission denied": Host needs password in hosts.yaml
+- "Connection timeout": Host offline or unreachable
+- "CLI not available": Install with install_agent(host, agent)"""
+
+    return instructions[:2000]
 
 
 mcp = FastMCP(
