@@ -234,11 +234,13 @@ maestro-mcp/
 ## Critical Rules
 
 1. **Don't kill the Maestro process** via Maestro tools
-2. **hosts.yaml is gitignored** - never commit it, use `hosts.example.yaml` for examples
-3. **Never commit secrets** - passwords, IP addresses, host names are sensitive
-4. **Cross-platform awareness** - Always check `config.shell` before commands
-5. **Context budget** - Use `head`/`tail` parameters, avoid large outputs
-6. **No sensitive info in examples** - Use generic names like "my-server" not real host names
+2. **Never edit hosts.yaml** - This file contains sensitive info (passwords, IPs). Users configure it manually, not agents.
+3. **hosts.yaml is gitignored** - never commit it, use `hosts.example.yaml` for examples
+4. **Never commit secrets** - passwords, IP addresses, host names are sensitive
+5. **Cross-platform awareness** - Always check `config.shell` before commands
+6. **Context budget** - Use `head`/`tail` parameters, avoid large outputs
+7. **No sensitive info in examples** - Use generic names like "my-server" not real host names
+8. **Get hosts from status()** - Call status() to see available hosts, don't hardcode or assume host names
 
 ## SSH Connection Architecture
 

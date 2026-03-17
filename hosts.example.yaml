@@ -1,6 +1,13 @@
 # hosts.yaml — define your machine fleet
-# Copy this file:  cp hosts.example.yaml hosts.yaml
-# Then edit with your real host definitions.
+# ============================================
+# MANUAL CONFIGURATION FILE - Do NOT let AI agents edit this.
+# Contains sensitive data: passwords, IP addresses, host names.
+# ============================================
+#
+# Setup:
+#   1. Copy this file:  cp hosts.example.yaml hosts.yaml
+#   2. Edit hosts.yaml with your real host definitions
+#   3. Ensure alias matches a Host entry in ~/.ssh/config
 #
 # Each host needs:
 #   alias: must match a Host entry in ~/.ssh/config
