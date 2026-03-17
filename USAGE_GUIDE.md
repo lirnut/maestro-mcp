@@ -53,23 +53,23 @@ status()  → Returns connectivity of all hosts
 
 ### 2. Run a quick command
 ```
-exec(host="bigai-pc", command="docker ps")
+exec(host="my-server", command="docker ps")
 ```
 
 ### 3. Read a config file
 ```
-read(host="cuc-server", path="/etc/nginx/nginx.conf")
+read(host="my-server", path="/etc/nginx/nginx.conf")
 ```
 
 ### 4. Deploy and run an AI task
 ```
-agent_status(host="bigai-pc")  # Check CLI availability
-run(host="bigai-pc", prompt="Fix the TypeScript errors in src/")
+agent_status(host="my-server")  # Check CLI availability
+run(host="my-server", prompt="Fix the TypeScript errors in src/")
 ```
 
 ### 5. Install a CLI if not available
 ```
-install_agent(host="bigai-pc", agent="opencode")
+install_agent(host="my-server", agent="opencode")
 ```
 
 ## Error Handling
