@@ -53,6 +53,7 @@ python -m py_compile maestro/tools/fleet.py
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,11 +63,7 @@ import yaml
 
 # Local imports (grouped by module)
 from maestro.config import MaestroConfig
-from maestro.hosts import (
-    HOSTS,
-    HostConfig,
-    HostShell,
-)
+from maestro.hosts import HOSTS, HostConfig, HostShell
 ```
 
 ### Type Annotations
@@ -111,10 +108,17 @@ from enum import Enum
 class HostStatus(Enum):
     UNKNOWN = "unknown"
     CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
 
 class HostShell(Enum):
     BASH = "bash"
     POWERSHELL = "powershell"
+
+class RemoteCLI(Enum):
+    OPENCODE = "opencode"
+    CODEX = "codex"
+    GEMINI = "gemini"
+    CLAUDE = "claude"
 ```
 
 ### Error Handling
@@ -124,8 +128,8 @@ class HostShell(Enum):
 ```python
 # Transient SSH failure (retry)
 if _is_transient_failure(rc, stderr):
-    await _warmup_connection(alias)
-    return await _ssh_run(host, command, timeout)
+    await pool.get_connection(host_name, params)
+    return await pool.run_command(host_name, params, command, timeout)
 
 # Permanent error (raise)
 raise RuntimeError(f"Failed to save session {session_id}: {e}")
@@ -164,8 +168,10 @@ cmd = f"Get-ChildItem {_ps_quote(path)}"
 async def my_tool(host: str, param: str = "default") -> str:
     """Brief description of what the tool does.
 
+    Use this for: Specific use case description.
+
     Args:
-        host: Target host name from fleet topology
+        host: Target host name from fleet (call status() to see available hosts)
         param: Description of parameter
 
     Returns:
@@ -208,8 +214,9 @@ maestro-mcp/
 ├── server.py              # Entry point, FastMCP setup
 ├── maestro/
 │   ├── config.py          # MaestroConfig dataclass
-│   ├── hosts.py           # Fleet topology, HostConfig, command helpers
-│   ├── transport.py       # SSH ControlMaster lifecycle
+│   ├── hosts.py           # Fleet topology, HostConfig, SSH config parsing
+│   ├── ssh_pool.py        # SSH connection pool using asyncssh
+│   ├── transport.py       # SSH transport layer
 │   ├── local.py           # Zero-overhead local execution
 │   ├── session_manager.py # Persistent session management
 │   ├── tools/
@@ -219,7 +226,7 @@ maestro-mcp/
 ├── tests/
 │   ├── test_primitives.py # Unit tests for pure functions
 │   └── test_oauth.py      # OAuth tests
-├── hosts.yaml             # Fleet definition (gitignored)
+├── hosts.yaml             # Fleet definition (gitignored - contains secrets)
 ├── hosts.example.yaml     # Example fleet config
 └── .env                   # Secrets (gitignored)
 ```
@@ -227,10 +234,32 @@ maestro-mcp/
 ## Critical Rules
 
 1. **Don't kill the Maestro process** via Maestro tools
-2. **hosts.yaml is gitignored** - use `hosts.example.yaml` for examples
-3. **Never commit secrets** - `.env` and `hosts.yaml` contain sensitive data
+2. **hosts.yaml is gitignored** - never commit it, use `hosts.example.yaml` for examples
+3. **Never commit secrets** - passwords, IP addresses, host names are sensitive
 4. **Cross-platform awareness** - Always check `config.shell` before commands
 5. **Context budget** - Use `head`/`tail` parameters, avoid large outputs
+6. **No sensitive info in examples** - Use generic names like "my-server" not real host names
+
+## SSH Connection Architecture
+
+Maestro uses `asyncssh` library for SSH connections:
+
+- **Connection Pool**: `ssh_pool.py` manages connections with automatic keepalive
+- **Authentication Priority**: SSH Agent → Key + passphrase → Password
+- **Config Loading**: SSH params parsed from `~/.ssh/config` automatically
+- **Host Config**: Password can be set in `hosts.yaml` for auto-auth
+
+```python
+# Connection params from HostConfig
+params = SSHConnectionParams(
+    host=cfg.hostname or cfg.alias,
+    port=cfg.port or 22,
+    user=cfg.user or "",
+    password=cfg.password or "",
+    key_path=cfg.key_path or "",
+    key_passphrase=cfg.key_passphrase or "",
+)
+```
 
 ## Key Patterns
 
@@ -257,4 +286,29 @@ Use `nohup` + PID file for hosts without tmux:
 ```python
 nohup bash -c '{cli_cmd}' > {output_file} 2>&1 &
 echo $! > {pid_file} && disown
+```
+
+## Tool Documentation Best Practices
+
+When adding new tools, follow this pattern:
+
+1. **"Use this for"** - Explain when to use the tool
+2. **Args section** - Document each parameter
+3. **Returns section** - Describe output format
+4. **Generic examples** - Use "my-host" not real host names
+
+```python
+@mcp.tool()
+async def my_tool(host: str, command: str) -> str:
+    """Run a command on a remote host.
+
+    Use this for: Single shell commands like docker ps, git status.
+
+    Args:
+        host: Host name from fleet (call status() to see available hosts)
+        command: Shell command to execute
+
+    Returns:
+        Command output or error message
+    """
 ```
