@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import time
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -273,6 +274,146 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
                     "error": f"Invalid direction '{direction}'. Use 'upload' or 'download'."
                 }
             )
+
+    @mcp.tool()
+    async def list_ssh_hosts() -> str:
+        """List all hosts defined in ~/.ssh/config.
+
+        Use this for: Discovering available SSH hosts before adding them to hosts.yaml.
+        Maestro reads hostname, port, user from SSH config automatically.
+        You only need to add password/key_passphrase to hosts.yaml if needed.
+
+        Returns:
+            JSON list of hosts with their SSH config details
+        """
+        from maestro.hosts import _list_ssh_config_hosts, HOSTS
+
+        ssh_hosts = _list_ssh_config_hosts()
+        existing_aliases = {cfg.alias for cfg in HOSTS.values() if not cfg.is_local}
+
+        result = []
+        for host in ssh_hosts:
+            for alias in host.get("aliases", []):
+                if alias == "*":
+                    continue
+                result.append(
+                    {
+                        "alias": alias,
+                        "hostname": host.get("hostname", alias),
+                        "port": host.get("port", 22),
+                        "user": host.get("user", ""),
+                        "key_path": host.get("key_path", ""),
+                        "in_hosts_yaml": alias in existing_aliases,
+                    }
+                )
+
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    async def add_host(
+        name: str,
+        alias: str,
+        description: str = "",
+        password: str = "",
+        key_passphrase: str = "",
+        remote_cli: str = "opencode",
+        is_local: bool = False,
+    ) -> str:
+        """Add a host to hosts.yaml configuration.
+
+        Use this for: Adding new hosts to the fleet. The alias must exist in ~/.ssh/config.
+        Maestro will read hostname, port, user from SSH config automatically.
+
+        Args:
+            name: Name for this host in Maestro (used as key in hosts.yaml)
+            alias: Must match a Host entry in ~/.ssh/config
+            description: Human-readable description
+            password: Server password (optional, for auto-auth)
+            key_passphrase: Passphrase for encrypted SSH key (optional)
+            remote_cli: Default CLI for this host (opencode/codex/gemini/claude)
+            is_local: Set true for the local machine (no SSH)
+
+        Returns:
+            Success message or error
+        """
+        from maestro.hosts import (
+            _find_hosts_config,
+            _parse_ssh_config,
+            RemoteCLI,
+            HOSTS,
+        )
+
+        if name in HOSTS:
+            return json.dumps(
+                {"error": f"Host '{name}' already exists in hosts.yaml"}, indent=2
+            )
+
+        hosts_path = _find_hosts_config()
+        if hosts_path is None:
+            hosts_path = Path(__file__).resolve().parent.parent / "hosts.yaml"
+
+        try:
+            remote_cli_enum = RemoteCLI(remote_cli.lower())
+        except ValueError:
+            return json.dumps(
+                {
+                    "error": f"Invalid remote_cli '{remote_cli}'. Valid options: opencode, codex, gemini, claude"
+                },
+                indent=2,
+            )
+
+        if not is_local:
+            ssh_config = _parse_ssh_config(alias)
+            if not ssh_config.get("hostname"):
+                return json.dumps(
+                    {
+                        "error": f"Alias '{alias}' not found in ~/.ssh/config or no hostname defined"
+                    },
+                    indent=2,
+                )
+
+        try:
+            if hosts_path.exists():
+                with open(hosts_path) as f:
+                    raw = yaml.safe_load(f) or {}
+            else:
+                raw = {"hosts": {}}
+
+            if "hosts" not in raw:
+                raw["hosts"] = {}
+
+            raw["hosts"][name] = {
+                "alias": alias,
+                "description": description,
+            }
+            if is_local:
+                raw["hosts"][name]["is_local"] = True
+            if password:
+                raw["hosts"][name]["password"] = password
+            if key_passphrase:
+                raw["hosts"][name]["key_passphrase"] = key_passphrase
+            if remote_cli_enum != RemoteCLI.OPENCODE:
+                raw["hosts"][name]["remote_cli"] = remote_cli_enum.value
+
+            hosts_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(hosts_path, "w") as f:
+                yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
+
+            from maestro.hosts import init_hosts
+
+            init_hosts()
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "message": f"Added host '{name}' to {hosts_path}",
+                    "host": raw["hosts"][name],
+                },
+                indent=2,
+            )
+
+        except Exception as e:
+            return json.dumps({"error": f"Failed to add host: {e}"}, indent=2)
 
     @mcp.tool()
     async def status() -> str:

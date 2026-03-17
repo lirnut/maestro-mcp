@@ -107,6 +107,60 @@ def _parse_ssh_config(alias: str) -> dict[str, Any]:
     return result
 
 
+def _list_ssh_config_hosts() -> list[dict[str, Any]]:
+    """List all hosts defined in ~/.ssh/config."""
+    config_path = Path.home() / ".ssh" / "config"
+    if not config_path.exists():
+        return []
+
+    hosts = []
+    current_block: dict[str, Any] = {}
+
+    with open(config_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+
+            key, value = parts[0].lower(), parts[1]
+
+            if key == "host":
+                if current_block.get("aliases"):
+                    hosts.append(current_block)
+                aliases = value.split()
+                current_block = {
+                    "aliases": aliases,
+                    "hostname": "",
+                    "user": "",
+                    "port": 22,
+                }
+                continue
+
+            if not current_block:
+                continue
+
+            if key == "hostname":
+                current_block["hostname"] = value
+            elif key == "user":
+                current_block["user"] = value
+            elif key == "port":
+                try:
+                    current_block["port"] = int(value)
+                except ValueError:
+                    pass
+            elif key in ("identityfile", "key_path"):
+                current_block["key_path"] = value.replace("~", str(Path.home()))
+
+    if current_block.get("aliases"):
+        hosts.append(current_block)
+
+    return hosts
+
+
 def _find_hosts_config() -> Path | None:
     """Find project-level hosts.yaml with priority search.
 
