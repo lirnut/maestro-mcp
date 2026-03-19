@@ -114,24 +114,30 @@ configure_relay(config=CONFIG, resolve_host=_resolve_host, scp_run=_scp_run)
 def _build_instructions() -> str:
     instructions = """Maestro: Multi-host fleet orchestration via SSH.
 
+CRITICAL RULES:
+- NEVER use 'ssh' command directly. Always use Maestro tools.
+- If connection fails, call reconnect_host(host) to retry.
+- Connection issues are usually transient - reconnect once or twice fixes them.
+
 QUICK START:
-1. status() - Check which hosts are connected and see available hosts
-2. exec(host, command) - Run shell commands on remote hosts
+1. status() - Check which hosts are connected
+2. exec(host, command) - Run shell commands
 3. read(host, path) / write(host, path, content) - File operations
-4. run(host, prompt) - Dispatch AI tasks using host's preferred CLI
+4. run(host, prompt) - Dispatch AI tasks
 
 TOOL SELECTION:
-- exec: Single shell command (e.g., exec("my-host", "docker ps"))
+- exec: Single shell command
 - script: Multi-line bash script
-- transfer: Upload/download files (direction: "upload" or "download")
-- run: AI tasks - uses opencode/codex/gemini/claude based on host config
+- transfer: Upload/download files
+- run: AI tasks (opencode/codex/gemini/claude)
+- reconnect_host: Retry failed connection (DO NOT use ssh command)
 
-HOST PARAMETER: Call status() to see available hosts, then use the name as the host parameter.
+HOST PARAMETER: Call status() to see available hosts.
 
-ERRORS:
-- "Permission denied": Host needs password in hosts.yaml
-- "Connection timeout": Host offline or unreachable
-- "CLI not available": Install with install_agent(host, agent)"""
+CONNECTION TROUBLESHOOTING:
+1. If "Connection failed" → Call reconnect_host(host)
+2. If still fails → Call status() to check host state
+3. NEVER fall back to 'ssh' command - it will NOT work better"""
 
     return instructions
 

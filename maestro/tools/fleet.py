@@ -416,6 +416,63 @@ def register_tools(mcp: object, config: MaestroConfig) -> None:
             return json.dumps({"error": f"Failed to add host: {e}"}, indent=2)
 
     @mcp.tool()
+    async def reconnect_host(host: str) -> str:
+        """Reconnect to a host by closing and re-establishing the SSH connection.
+
+        Use this for: When a host shows as disconnected or commands fail.
+        Connection issues are usually transient - reconnect once or twice fixes them.
+        DO NOT fall back to 'ssh' command - use this tool instead.
+
+        Args:
+            host: Host name from fleet to reconnect
+
+        Returns:
+            JSON with connection status
+        """
+        from maestro.ssh_pool import get_ssh_pool, close_ssh_pool
+        from maestro.transport import _get_ssh_params
+
+        cfg = _resolve_host(host)
+        if cfg.is_local:
+            return json.dumps(
+                {
+                    "host": host,
+                    "status": "local",
+                    "message": "Local host needs no reconnection",
+                }
+            )
+
+        pool = get_ssh_pool()
+        await pool.close_connection(host)
+        await _update_host_status(host, HostStatus.DISCONNECTED)
+
+        await asyncio.sleep(1)
+
+        params = _get_ssh_params(cfg)
+        try:
+            await pool.get_connection(host, params)
+            await _update_host_status(host, HostStatus.CONNECTED)
+            return json.dumps(
+                {
+                    "host": host,
+                    "status": "connected",
+                    "message": "Reconnection successful",
+                },
+                indent=2,
+            )
+        except Exception as e:
+            await _update_host_status(host, HostStatus.ERROR, last_error=str(e))
+            return json.dumps(
+                {
+                    "host": host,
+                    "status": "failed",
+                    "error": str(e),
+                    "hint": "Try calling reconnect_host again, or check if the host is online",
+                },
+                indent=2,
+            )
+
+    @mcp.tool()
     async def status() -> str:
         """Check connectivity of all hosts. Returns structured JSON."""
 
