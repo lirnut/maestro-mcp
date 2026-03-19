@@ -119,18 +119,32 @@ CRITICAL RULES:
 - If connection fails, call reconnect_host(host) to retry.
 - Connection issues are usually transient - reconnect once or twice fixes them.
 
+LONG-RUNNING COMMANDS (IMPORTANT):
+- exec() has a timeout limit. Commands taking >30s will fail.
+- For long commands (training, sleep, etc.), use create_persistent_session() instead.
+- persistent_session runs in background and survives disconnection.
+
 QUICK START:
 1. status() - Check which hosts are connected
-2. exec(host, command) - Run shell commands
-3. read(host, path) / write(host, path, content) - File operations
-4. run(host, prompt) - Dispatch AI tasks
+2. exec(host, command) - Run FAST shell commands (< 30s)
+3. create_persistent_session(host, agent, prompt) - Run LONG tasks in background
+4. get_persistent_session(host, session_id) - Check long task results
 
 TOOL SELECTION:
-- exec: Single shell command
-- script: Multi-line bash script
-- transfer: Upload/download files
+- exec: Fast commands only (< 30s): ls, cat, docker ps, tail, grep
+- script: Fast multi-line scripts (< 30s)
+- create_persistent_session: Long tasks: training, sleep, wget, compilation
 - run: AI tasks (opencode/codex/gemini/claude)
-- reconnect_host: Retry failed connection (DO NOT use ssh command)
+- reconnect_host: Retry failed connection
+
+EXAMPLE - Long running task:
+# WRONG: exec(host, "sleep 60 && tail log") - will timeout!
+# RIGHT:
+session = create_persistent_session(host="ymedia", agent="opencode", prompt="Wait for training epoch and check logs")
+# Returns: {"session_id": "abc123", "status": "running"}
+# Later:
+get_persistent_session(host="ymedia", session_id="abc123")
+# Returns: {"status": "completed", "output": "..."}
 
 HOST PARAMETER: Call status() to see available hosts.
 
