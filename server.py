@@ -116,8 +116,9 @@ def _build_instructions() -> str:
 
 CRITICAL RULES:
 - NEVER use 'ssh' command directly. Always use Maestro tools.
+- DO NOT call multiple exec() in parallel - they share SSH connection and will timeout.
+- Call exec() SEQUENTIALLY, one at a time.
 - If connection fails, call reconnect_host(host) to retry.
-- Connection issues are usually transient - reconnect once or twice fixes them.
 
 LONG-RUNNING COMMANDS (IMPORTANT):
 - exec() has a timeout limit. Commands taking >30s will fail.
@@ -126,7 +127,7 @@ LONG-RUNNING COMMANDS (IMPORTANT):
 
 QUICK START:
 1. status() - Check which hosts are connected
-2. exec(host, command) - Run FAST shell commands (< 30s)
+2. exec(host, command) - Run FAST shell commands (< 30s), ONE AT A TIME
 3. create_persistent_session(host, agent, prompt) - Run LONG tasks in background
 4. get_persistent_session(host, session_id) - Check long task results
 
@@ -137,19 +138,20 @@ TOOL SELECTION:
 - run: AI tasks (opencode/codex/gemini/claude)
 - reconnect_host: Retry failed connection
 
+EXAMPLE - Correct sequential execution:
+# CORRECT: Call exec() one at a time
+exec(host="ymedia", command="ps aux | grep python")
+exec(host="ymedia", command="ls -la ~/checkpoints/")
+# WRONG: Parallel exec() calls will timeout!
+
 EXAMPLE - Long running task:
-# WRONG: exec(host, "sleep 60 && tail log") - will timeout!
-# RIGHT:
-session = create_persistent_session(host="ymedia", agent="opencode", prompt="Wait for training epoch and check logs")
-# Returns: {"session_id": "abc123", "status": "running"}
-# Later:
+session = create_persistent_session(host="ymedia", agent="opencode", prompt="Wait for training epoch")
 get_persistent_session(host="ymedia", session_id="abc123")
-# Returns: {"status": "completed", "output": "..."}
 
 HOST PARAMETER: Call status() to see available hosts.
 
 CONNECTION TROUBLESHOOTING:
-1. If "Connection failed" → Call reconnect_host(host)
+1. If "Connection failed" or timeout → Call reconnect_host(host)
 2. If still fails → Call status() to check host state
 3. NEVER fall back to 'ssh' command - it will NOT work better"""
 
