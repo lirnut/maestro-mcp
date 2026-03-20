@@ -49,20 +49,26 @@ class SSHConnectionPool:
     def __init__(self):
         self._connections: dict[str, SSHConnection] = {}
         self._keepalive_tasks: dict[str, asyncio.Task] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-
-    def _get_lock(self, name: str) -> asyncio.Lock:
-        if name not in self._locks:
-            self._locks[name] = asyncio.Lock()
-        return self._locks[name]
+        self._connect_locks: dict[str, asyncio.Lock] = {}
 
     async def get_connection(
         self,
         name: str,
         params: SSHConnectionParams,
     ) -> asyncssh.SSHClientConnection:
-        lock = self._get_lock(name)
-        async with lock:
+        if name in self._connections:
+            ssh_conn = self._connections[name]
+            try:
+                if not ssh_conn.conn.is_closed():
+                    ssh_conn.last_used = time.time()
+                    return ssh_conn.conn
+            except Exception:
+                pass
+
+        if name not in self._connect_locks:
+            self._connect_locks[name] = asyncio.Lock()
+
+        async with self._connect_locks[name]:
             if name in self._connections:
                 ssh_conn = self._connections[name]
                 if await self._is_valid(ssh_conn.conn):
@@ -173,8 +179,9 @@ class SSHConnectionPool:
         self._keepalive_tasks[name] = asyncio.create_task(keepalive_loop())
 
     async def close_connection(self, name: str):
-        lock = self._get_lock(name)
-        async with lock:
+        if name not in self._connect_locks:
+            self._connect_locks[name] = asyncio.Lock()
+        async with self._connect_locks[name]:
             await self._close_connection_internal(name)
 
     async def _close_connection_internal(self, name: str):
