@@ -116,9 +116,8 @@ def _build_instructions() -> str:
 
 CRITICAL RULES:
 - NEVER use 'ssh' command directly. Always use Maestro tools.
-- DO NOT call multiple exec() in parallel - they share SSH connection and will timeout.
-- Call exec() SEQUENTIALLY, one at a time.
 - If connection fails, call reconnect_host(host) to retry.
+- Connection issues are usually transient - reconnect once or twice fixes them.
 
 LONG-RUNNING COMMANDS (IMPORTANT):
 - exec() has a timeout limit. Commands taking >30s will fail.
@@ -127,26 +126,26 @@ LONG-RUNNING COMMANDS (IMPORTANT):
 
 QUICK START:
 1. status() - Check which hosts are connected
-2. exec(host, command) - Run FAST shell commands (< 30s), ONE AT A TIME
+2. exec(host, command) - Run FAST shell commands (< 30s)
 3. create_persistent_session(host, agent, prompt) - Run LONG tasks in background
 4. get_persistent_session(host, session_id) - Check long task results
 
 TOOL SELECTION:
-- exec: Fast commands only (< 30s): ls, cat, docker ps, tail, grep
+- exec: Fast commands (< 30s): ls, cat, docker ps, tail, grep. Can be called in parallel.
 - script: Fast multi-line scripts (< 30s)
 - create_persistent_session: Long tasks: training, sleep, wget, compilation
 - run: AI tasks (opencode/codex/gemini/claude)
 - reconnect_host: Retry failed connection
 
-EXAMPLE - Correct sequential execution:
-# CORRECT: Call exec() one at a time
-exec(host="ymedia", command="ps aux | grep python")
-exec(host="ymedia", command="ls -la ~/checkpoints/")
-# WRONG: Parallel exec() calls will timeout!
+EXAMPLE - Parallel execution (now supported):
+# You can call multiple exec() in parallel for faster results
+exec(host="my-host", command="ps aux | grep python")
+exec(host="my-host", command="ls -la ~/checkpoints/")
+exec(host="my-host", command="df -h")
 
 EXAMPLE - Long running task:
-session = create_persistent_session(host="ymedia", agent="opencode", prompt="Wait for training epoch")
-get_persistent_session(host="ymedia", session_id="abc123")
+session = create_persistent_session(host="my-host", agent="opencode", prompt="Wait for training")
+get_persistent_session(host="my-host", session_id="abc123")
 
 HOST PARAMETER: Call status() to see available hosts.
 
