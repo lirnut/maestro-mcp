@@ -133,17 +133,21 @@ async def _scp_run(
 
     try:
         if upload:
-            success = await pool.put_file(host_name, params, source, destination)
+            success, error = await pool.put_file(
+                host_name, params, source, destination, timeout
+            )
             action = f"upload {source} -> {host_name}:{destination}"
         else:
-            success = await pool.get_file(host_name, params, source, destination)
+            success, error = await pool.get_file(
+                host_name, params, source, destination, timeout
+            )
             action = f"download {host_name}:{source} -> {destination}"
 
         if success:
             config.status = HostStatus.CONNECTED
             return f"[OK] {action}"
         else:
-            return f"[SFTP failed] {action}"
+            return f"[SFTP failed] {action}: {error}"
     except Exception as e:
         config.status = HostStatus.ERROR
         config.last_error = str(e)

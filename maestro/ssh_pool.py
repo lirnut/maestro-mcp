@@ -237,15 +237,19 @@ class SSHConnectionPool:
         params: SSHConnectionParams,
         local_path: str,
         remote_path: str,
-    ) -> bool:
+        timeout: int = 300,
+    ) -> tuple[bool, str]:
         conn = await self.get_connection(name, params)
         try:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.put(local_path, remote_path)
-            return True
+            async with asyncio.timeout(timeout):
+                async with conn.start_sftp_client() as sftp:
+                    await sftp.put(local_path, remote_path)
+            return True, ""
+        except asyncio.TimeoutError:
+            return False, f"SFTP upload timeout after {timeout}s"
         except Exception as e:
             logger.error(f"SFTP put failed: {e}")
-            return False
+            return False, str(e)
 
     async def get_file(
         self,
@@ -253,15 +257,19 @@ class SSHConnectionPool:
         params: SSHConnectionParams,
         remote_path: str,
         local_path: str,
-    ) -> bool:
+        timeout: int = 300,
+    ) -> tuple[bool, str]:
         conn = await self.get_connection(name, params)
         try:
-            async with conn.start_sftp_client() as sftp:
-                await sftp.get(remote_path, local_path)
-            return True
+            async with asyncio.timeout(timeout):
+                async with conn.start_sftp_client() as sftp:
+                    await sftp.get(remote_path, local_path)
+            return True, ""
+        except asyncio.TimeoutError:
+            return False, f"SFTP download timeout after {timeout}s"
         except Exception as e:
             logger.error(f"SFTP get failed: {e}")
-            return False
+            return False, str(e)
 
 
 _ssh_pool: SSHConnectionPool | None = None
