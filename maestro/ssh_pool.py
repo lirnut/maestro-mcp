@@ -143,6 +143,29 @@ class SSHConnectionPool:
             )
             return conn
         except Exception as e:
+            # 如果认证失败且有密码，尝试只用密码认证
+            if params.password and "permission" in str(e).lower():
+                logger.info(
+                    f"Key auth failed, falling back to password auth for {params.host}"
+                )
+                fallback_kwargs = {
+                    "host": params.host,
+                    "port": params.port,
+                    "username": params.user or None,
+                    "known_hosts": None,
+                    "connect_timeout": 30,
+                    "password": params.password,
+                    "preferred_authentications": ["password"],
+                }
+                try:
+                    conn = await asyncssh.connect(**fallback_kwargs)
+                    logger.info(
+                        f"Connected to {params.host}:{params.port} (password fallback)"
+                    )
+                    return conn
+                except Exception as fallback_error:
+                    logger.error(f"Password fallback also failed: {fallback_error}")
+                    raise
             logger.error(f"Failed to connect to {params.host}:{params.port}: {e}")
             raise
 
