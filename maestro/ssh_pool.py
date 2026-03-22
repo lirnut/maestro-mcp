@@ -234,12 +234,13 @@ class SSHConnectionPool:
         command: str,
         timeout: int = 300,
         cwd: str | None = None,
+        stdin_data: str | None = None,
     ) -> tuple[int, str, str]:
         conn = await self.get_connection(name, params)
         full_command = f"cd {cwd} && {command}" if cwd else command
         try:
             result = await asyncio.wait_for(
-                conn.run(full_command, timeout=timeout),
+                conn.run(full_command, timeout=timeout, input=stdin_data),
                 timeout=timeout + 10,
             )
             stdout = result.stdout or ""

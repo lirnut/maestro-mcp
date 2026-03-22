@@ -107,7 +107,7 @@ async def _ssh_run(
 
     try:
         rc, stdout, stderr = await pool.run_command(
-            host_name, params, command, timeout=timeout
+            host_name, params, command, timeout=timeout, stdin_data=stdin_data
         )
         config.status = HostStatus.CONNECTED
         return _FORMAT_RESULT(stdout, stderr, rc)
