@@ -43,6 +43,7 @@ class SSHConnectionParams:
     key_path: str = ""
     key_passphrase: str = ""
     alias: str = ""
+    proxy_jump: str = ""  # Jump host alias for ProxyJump support
 
 
 class SSHConnectionPool:
@@ -126,6 +127,37 @@ class SSHConnectionPool:
 
         if not auth_methods:
             connect_kwargs["client_host_keys"] = None
+
+        # Handle ProxyJump
+        jump_conn = None
+        if params.proxy_jump:
+            logger.info(
+                f"Connecting to {params.host}:{params.port} via jump host {params.proxy_jump}"
+            )
+            from .hosts import HOSTS
+
+            # Try exact match first, then case-insensitive
+            jump_host = HOSTS.get(params.proxy_jump)
+            if not jump_host:
+                for name, host in HOSTS.items():
+                    if name.lower() == params.proxy_jump.lower():
+                        jump_host = host
+                        break
+
+            if jump_host:
+                jump_params = SSHConnectionParams(
+                    host=jump_host.hostname or jump_host.alias,
+                    port=jump_host.port or 22,
+                    user=jump_host.user or "",
+                    password=jump_host.password or "",
+                    key_path=jump_host.key_path or "",
+                    key_passphrase=jump_host.key_passphrase or "",
+                    alias=jump_host.alias,
+                )
+                jump_conn = await self._create_connection(jump_params)
+                connect_kwargs["tunnel"] = jump_conn
+            else:
+                logger.warning(f"Jump host {params.proxy_jump} not found in hosts")
 
         logger.info(
             f"Connecting to {params.host}:{params.port} (auth: {', '.join(auth_methods) or 'default'})"

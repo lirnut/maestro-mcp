@@ -53,6 +53,7 @@ def _get_ssh_params(host_config: Any) -> SSHConnectionParams:
         key_path=host_config.key_path or "",
         key_passphrase=host_config.key_passphrase or "",
         alias=host_config.alias,
+        proxy_jump=getattr(host_config, "proxy_jump", "") or "",
     )
 
 

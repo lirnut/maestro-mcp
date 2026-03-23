@@ -245,9 +245,10 @@ maestro-mcp/
 Maestro uses `asyncssh` library for SSH connections:
 
 - **Connection Pool**: `ssh_pool.py` manages connections with automatic keepalive
-- **Authentication Priority**: SSH Agent → Key + passphrase → Password
+- **Authentication Priority**: SSH Agent → Key + passphrase → Password fallback
 - **Config Loading**: SSH params parsed from `~/.ssh/config` automatically
-- **Host Config**: Password can be set in `hosts.yaml` for auto-auth
+- **Host Config**: Password and `key_passphrase` can be set in `hosts.yaml`
+- **ProxyJump**: Supported via `ProxyJump` directive in `~/.ssh/config`
 
 ```python
 # Connection params from HostConfig
@@ -258,8 +259,26 @@ params = SSHConnectionParams(
     password=cfg.password or "",
     key_path=cfg.key_path or "",
     key_passphrase=cfg.key_passphrase or "",
+    proxy_jump=cfg.proxy_jump or "",  # Jump host alias
 )
 ```
+
+### ProxyJump Configuration
+
+Hosts behind a jump server use the `ProxyJump` directive in `~/.ssh/config`:
+
+```ssh-config
+Host jump-host
+    HostName 192.168.1.1
+    User admin
+
+Host target-behind-jump
+    HostName 10.0.0.5
+    User dev
+    ProxyJump jump-host
+```
+
+The jump host name in `ProxyJump` is matched case-insensitively against hosts in `hosts.yaml`.
 
 ## Key Patterns
 

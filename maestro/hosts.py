@@ -61,6 +61,7 @@ class HostConfig:
     port: int = 22
     user: str = ""
     key_path: str = ""
+    proxy_jump: str = ""  # Jump host alias
     # Remote CLI preference
     remote_cli: RemoteCLI = RemoteCLI.OPENCODE
 
@@ -103,6 +104,8 @@ def _parse_ssh_config(alias: str) -> dict[str, Any]:
                 result["user"] = value
             elif key in ("identityfile", "key_path"):
                 result["key_path"] = value.replace("~", str(Path.home()))
+            elif key == "proxyjump":
+                result["proxy_jump"] = value
 
     return result
 
@@ -252,6 +255,7 @@ def _load_hosts(config_path: Path | None = None) -> dict[str, HostConfig]:
             hosts[name].port = ssh_config.get("port", 22)
             hosts[name].user = ssh_config.get("user", "")
             hosts[name].key_path = ssh_config.get("key_path", "")
+            hosts[name].proxy_jump = ssh_config.get("proxy_jump", "")
 
     if not hosts:
         raise SystemExit(f"No hosts defined in {config_path}")
